@@ -1,0 +1,249 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SDF Viewer</title>
+  <style>
+    :root { color-scheme: dark; font: 14px/1.4 system-ui, sans-serif; }
+    * { box-sizing: border-box; }
+    body { margin: 0; min-height: 100vh; color: #eef2f5; background: #151a20; }
+    .shell { min-height: 100vh; display: grid; grid-template-rows: auto minmax(0, 1fr) auto; }
+    header, footer { display: flex; align-items: center; gap: 12px; padding: 12px 18px; }
+    header { border-bottom: 1px solid #333c45; }
+    footer { border-top: 1px solid #333c45; color: #a9b5c0; font-size: 12px; }
+    h1 { font-size: 15px; font-weight: 650; margin: 0; text-transform: capitalize; }
+    details { position: relative; }
+    summary { cursor: pointer; color: #bdcbd6; }
+    .finishes { position: absolute; z-index: 2; top: 28px; left: 0; min-width: 220px;
+                padding: 10px; border: 1px solid #46525f; border-radius: 8px; background: #222b34;
+                box-shadow: 0 12px 28px #0007; }
+    .finish { display: flex; align-items: center; gap: 9px; white-space: nowrap; padding: 4px 0; }
+    .swatch { width: 18px; height: 18px; border: 1px solid #ffffff44; border-radius: 4px; }
+    .finish small { color: #a9b5c0; margin-left: auto; }
+    .grow { flex: 1; }
+    button { appearance: none; border: 1px solid #46525f; border-radius: 7px; background: #222b34;
+             color: inherit; padding: 7px 10px; font: inherit; cursor: pointer; }
+    button:hover { background: #33414d; }
+    button:focus-visible, .stage:focus-visible { outline: 2px solid #77bbec; outline-offset: 2px; }
+    .stage-wrap { min-height: 0; display: grid; place-items: center; padding: 24px; }
+    .stage { width: min(100%, calc((100vh - 174px) * 4 / 3)); aspect-ratio: 4 / 3;
+             position: relative; background: #e8e8e2; border-radius: 10px; overflow: hidden;
+             cursor: grab; touch-action: none; box-shadow: 0 20px 65px #0008; }
+    .stage.dragging { cursor: grabbing; }
+    .stage img { width: 100%; height: 100%; display: block; object-fit: fill; pointer-events: none; }
+    .stage::after { content: ""; position: absolute; inset: 0; pointer-events: none;
+                    border: 1px solid #ffffff24; border-radius: inherit; }
+    .hint { position: absolute; top: 12px; left: 12px; padding: 6px 9px;
+            border-radius: 5px; color: #293039; background: #ffffffe8; font-size: 12px; }
+    .status { display: inline-flex; align-items: center; gap: 7px; }
+    .dot { width: 7px; height: 7px; border-radius: 50%; background: #75c58a; }
+    .busy .dot { background: #e9bd69; }
+    .error .dot { background: #ef7979; }
+    .camera { font-family: ui-monospace, SFMono-Regular, monospace; }
+    .embed header, .embed footer { display: none; }
+    .embed .stage-wrap { padding: 0; }
+    .embed .stage { width: 100%; max-width: none; height: 100vh; border-radius: 0; }
+    .embed .hint { display: none; }
+    @media (max-width: 650px) {
+      header { flex-wrap: wrap; }
+      header .grow { flex-basis: 100%; }
+      footer { flex-wrap: wrap; }
+      .camera { display: none; }
+      .stage-wrap { padding: 8px; }
+      .stage { width: 100%; }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <header>
+      <h1 id="name">SDF Viewer</h1>
+      <details id="materials" hidden><summary>Materials</summary><div class="finishes" id="finishes"></div></details>
+      <span class="grow"></span>
+      <button id="projection" title="Switch projection">Perspective</button>
+      <button id="reset" title="Reset camera">Reset view</button>
+      <button id="download" title="Save the current image">Save PNG</button>
+      <button id="copy" title="Copy camera coordinates">Copy camera</button>
+    </header>
+    <main class="stage-wrap">
+      <div class="stage" id="stage" tabindex="0" aria-label="3D model viewer. Drag to orbit, Shift drag to pan, scroll to zoom.">
+        <img id="image" alt="Rendered 3D model">
+        <div class="hint" id="hint">Drag to orbit · Shift drag to pan · Scroll to zoom</div>
+      </div>
+    </main>
+    <footer>
+      <span class="status busy" id="status"><span class="dot"></span><span id="status-text">Loading scene…</span></span>
+      <span class="grow"></span><span class="camera" id="camera"></span>
+    </footer>
+  </div>
+  <script>
+    if (new URLSearchParams(location.search).has('embed')) document.body.classList.add('embed');
+    const $ = (id) => document.getElementById(id);
+    const stage = $('stage');
+    const image = $('image');
+    let initial, camera, previousFov = 40;
+    let drag = null, settledTimer = null, pending = null, busy = false, revision = 0;
+    let imageUrl = null, imageBlob = null;
+
+    function status(message, kind = '') {
+      $('status').className = `status ${kind}`;
+      $('status-text').textContent = message;
+    }
+    function vec(a, b) { return a.map((v, i) => v - b[i]); }
+    function norm(v) { return Math.hypot(...v); }
+    function unit(v) { const n = norm(v); return v.map(x => x / n); }
+    function cross(a, b) {
+      return [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+    }
+    function updateCameraText() {
+      $('camera').textContent = `Eye ${camera.eye.map(x => x.toFixed(2)).join(', ')} · Target ${camera.target.map(x => x.toFixed(2)).join(', ')}`;
+      $('projection').textContent = camera.fov === 0 ? 'Orthographic' : 'Perspective';
+    }
+    function poseKey(value) {
+      return JSON.stringify([value.eye, value.target, value.fov, value.cameraSize, value.far]);
+    }
+    function queueRender(full = false) {
+      if (!camera) return;
+      clearTimeout(settledTimer);
+      const width = full ? 320 : 160;
+      pending = { ...camera, eye: [...camera.eye], target: [...camera.target], width, height: width * 3 / 4 };
+      revision++;
+      updateCameraText();
+      if (!busy) renderLoop();
+      if (!full) settledTimer = setTimeout(() => queueRender(true), 350);
+    }
+    async function renderLoop() {
+      busy = true;
+      while (pending) {
+        const job = pending;
+        const jobRevision = revision;
+        pending = null;
+        status(job.width === 160 ? 'Rendering preview…' : 'Rendering detail…', 'busy');
+        try {
+          const response = await fetch('render', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(job)
+          });
+          if (!response.ok) throw new Error(await response.text());
+          const blob = await response.blob();
+          if (jobRevision === revision ||
+              (pending && job.width < pending.width && poseKey(job) === poseKey(pending))) {
+            const url = URL.createObjectURL(blob);
+            image.src = url;
+            if (imageUrl) URL.revokeObjectURL(imageUrl);
+            imageUrl = url;
+            imageBlob = blob;
+            status(job.width === 160 ? 'Preview ready' : 'Ready');
+          }
+        } catch (error) {
+          if (jobRevision === revision) status(error.message || 'Render failed', 'error');
+        }
+      }
+      busy = false;
+    }
+    function orbit(dx, dy) {
+      const offset = vec(camera.eye, camera.target);
+      const radius = norm(offset);
+      const azimuth = Math.atan2(offset[1], offset[0]) - dx * 0.008;
+      const elevation = Math.max(-1.52, Math.min(1.52, Math.asin(offset[2] / radius) - dy * 0.008));
+      camera.eye = [
+        camera.target[0] + radius * Math.cos(elevation) * Math.cos(azimuth),
+        camera.target[1] + radius * Math.cos(elevation) * Math.sin(azimuth),
+        camera.target[2] + radius * Math.sin(elevation)
+      ];
+    }
+    function pan(dx, dy) {
+      const forward = unit(vec(camera.target, camera.eye));
+      const right = unit(cross(forward, [0, 0, 1]));
+      const up = cross(right, forward);
+      const scale = (camera.fov === 0 ? camera.cameraSize :
+        2 * norm(vec(camera.eye, camera.target)) * Math.tan(camera.fov * Math.PI / 360)) / stage.clientHeight;
+      const shift = right.map((v, i) => -dx * scale * v + dy * scale * up[i]);
+      camera.eye = camera.eye.map((v, i) => v + shift[i]);
+      camera.target = camera.target.map((v, i) => v + shift[i]);
+    }
+    stage.addEventListener('pointerdown', event => {
+      if (event.button !== 0 && event.button !== 2) return;
+      stage.setPointerCapture(event.pointerId);
+      drag = { x: event.clientX, y: event.clientY, pan: event.button === 2 || event.shiftKey };
+      stage.classList.add('dragging');
+    });
+    stage.addEventListener('pointermove', event => {
+      if (!drag || !camera) return;
+      const dx = event.clientX - drag.x, dy = event.clientY - drag.y;
+      drag.x = event.clientX; drag.y = event.clientY;
+      if (!dx && !dy) return;
+      if (drag.pan || event.shiftKey) pan(dx, dy); else orbit(dx, dy);
+      queueRender();
+    });
+    function endDrag() {
+      if (!drag) return;
+      drag = null;
+      stage.classList.remove('dragging');
+      queueRender(true);
+    }
+    stage.addEventListener('pointerup', endDrag);
+    stage.addEventListener('pointercancel', endDrag);
+    stage.addEventListener('contextmenu', event => event.preventDefault());
+    stage.addEventListener('wheel', event => {
+      if (!camera) return;
+      event.preventDefault();
+      const factor = Math.exp(Math.max(-300, Math.min(300, event.deltaY)) * 0.001);
+      if (camera.fov === 0) camera.cameraSize = Math.max(0.01, Math.min(1000, camera.cameraSize * factor));
+      else {
+        const offset = vec(camera.eye, camera.target);
+        const ratio = Math.max(0.01, Math.min(1000, norm(offset) * factor)) / norm(offset);
+        camera.eye = camera.target.map((v, i) => v + offset[i] * ratio);
+      }
+      queueRender();
+    }, { passive: false });
+    $('projection').onclick = () => {
+      const radius = norm(vec(camera.eye, camera.target));
+      if (camera.fov === 0) camera.fov = previousFov;
+      else {
+        previousFov = camera.fov;
+        camera.cameraSize = 2 * radius * Math.tan(camera.fov * Math.PI / 360);
+        camera.fov = 0;
+      }
+      queueRender(true);
+    };
+    $('reset').onclick = () => { camera = structuredClone(initial); queueRender(true); };
+    $('download').onclick = () => {
+      if (!imageBlob) return;
+      const a = document.createElement('a');
+      a.href = imageUrl; a.download = `${initial.name.replaceAll(' ', '-')}.png`; a.click();
+    };
+    $('copy').onclick = async () => {
+      await navigator.clipboard.writeText(JSON.stringify({
+        eye: camera.eye, target: camera.target, fov: camera.fov,
+        camera_size: camera.cameraSize, far: camera.far
+      }, null, 2));
+      status('Camera copied');
+    };
+    fetch('config').then(response => response.json()).then(config => {
+      initial = config;
+      camera = structuredClone(config);
+      $('name').textContent = config.name;
+      document.title = `${config.name} · SDF Viewer`;
+      const finishes = Object.entries(config.materials || {});
+      if (finishes.length) {
+        $('materials').hidden = false;
+        for (const [name, finish] of finishes) {
+          const row = document.createElement('div');
+          row.className = 'finish';
+          const swatch = document.createElement('span');
+          swatch.className = 'swatch';
+          swatch.style.backgroundColor = finish.base_color;
+          const label = document.createElement('span');
+          label.textContent = name.replaceAll('_', ' ');
+          const values = document.createElement('small');
+          values.textContent = `M ${finish.metallic.toFixed(2)} · R ${finish.roughness.toFixed(2)}`;
+          row.append(swatch, label, values);
+          $('finishes').append(row);
+        }
+      }
+      queueRender();
+    }).catch(error => status(error.message || 'Could not load scene', 'error'));
+  </script>
+</body>
+</html>
