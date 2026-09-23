@@ -1,0 +1,8 @@
+.venv/
+__pycache__/
+*.pyc
+render.png
+render.json
+scene.glsl
+scene.json
+*_volume_*.f32
