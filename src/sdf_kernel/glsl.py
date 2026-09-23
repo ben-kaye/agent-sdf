@@ -1,458 +1,549 @@
-"""Translate bounded, pointwise JAX geometry to GLSL ES 3.00."""
+"""Lower the immutable Shape tree directly to GLSL ES 3.00."""
 
 from __future__ import annotations
 
-from itertools import product
-from math import isfinite
+from math import cos, hypot, isfinite, sin
 
-import jax
-import jax.numpy as jnp
 import numpy as np
 
 from .dsl import Model, Shape
 
-_MAX_ELEMENTS = 4096
-_MAX_STATEMENTS = 60000
-_MAX_SCAN = 128
+_MAX_NODES = 1024
+_MAX_SWEEP_SPANS = 128
+_MAX_PROFILE_SEGMENTS = 2048
 
 
-def _type(dtype):
-    kind = np.dtype(dtype).kind
-    if kind == "b":
-        return "bool"
-    if kind in "iu":
-        if np.dtype(dtype).itemsize != 4:
-            raise ValueError("GLSL viewer supports only 32-bit integer geometry")
-        return "uint" if kind == "u" else "int"
-    if kind == "f" and np.dtype(dtype).itemsize == 4:
-        return "float"
-    raise ValueError(f"GLSL viewer does not support geometry dtype {dtype}; use float32")
-
-
-def _literal(value, dtype):
-    typ = _type(dtype)
-    if typ == "bool":
-        return "true" if value else "false"
-    if typ in ("int", "uint"):
-        value = int(value)
-        if typ == "int" and value == -2147483648:
-            return "(-2147483647 - 1)"
-        return str(value) + ("u" if typ == "uint" else "")
+def _f(value):
     value = float(value)
     if not isfinite(value):
-        bits = np.asarray(value, dtype=np.float32).view(np.uint32).item()
-        return f"uintBitsToFloat({bits}u)"
+        raise ValueError("GLSL geometry requires finite constants")
     result = repr(value)
     return result if "." in result or "e" in result else result + ".0"
 
 
-class _Compiler:
+def _v(values):
+    values = tuple(values)
+    return f"vec{len(values)}(" + ", ".join(map(_f, values)) + ")"
+
+
+def _mat_inverse(matrix):
+    try:
+        result = np.linalg.inv(np.asarray(matrix, dtype=float))
+    except np.linalg.LinAlgError as exc:
+        raise ValueError("GLSL affine transform must be invertible") from exc
+    return tuple(tuple(float(x) for x in row) for row in result)
+
+
+def _affine_point(matrix, translation, p):
+    coordinates = "xy" if len(translation) == 2 else "xyz"
+    return (
+        f"vec{len(translation)}("
+        + ", ".join(
+            " + ".join(
+                f"{_f(value)} * ({p}.{axis} - {_f(translation[j])})"
+                for j, (axis, value) in enumerate(zip(coordinates, row, strict=True))
+            )
+            for row in matrix
+        )
+        + ")"
+    )
+
+
+_HELPERS = """
+float cap2(float a, float b) {
+  return length(max(vec2(a, b), 0.0)) + min(max(a, b), 0.0);
+}
+float sdBox2(vec2 p, vec2 halfSize, float radius) {
+  vec2 q = abs(p) - halfSize + radius;
+  return length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - radius;
+}
+float sdBox3(vec3 p, vec3 halfSize, float radius) {
+  vec3 q = abs(p) - halfSize + radius;
+  return length(max(q, 0.0)) + min(max(q.x, max(q.y, q.z)), 0.0) - radius;
+}
+float sdSegment2(vec2 p, vec2 a, vec2 b) {
+  vec2 e = b - a;
+  return length(p - a - clamp(dot(p - a, e) / dot(e, e), 0.0, 1.0) * e);
+}
+float sdSegment3(vec3 p, vec3 a, vec3 b) {
+  vec3 e = b - a;
+  return length(p - a - clamp(dot(p - a, e) / dot(e, e), 0.0, 1.0) * e);
+}
+float sdArc2(vec2 p, vec2 center, vec2 start, vec2 end, float sweep) {
+  vec2 radial = p - center;
+  float startAngle = atan(start.y - center.y, start.x - center.x);
+  float progress = mod((atan(radial.y, radial.x) - startAngle) * sign(sweep), 6.283185307179586);
+  float circleDistance = abs(length(radial) - length(start - center));
+  float endpointDistance = min(length(p - start), length(p - end));
+  return progress <= abs(sweep) ? circleDistance : endpointDistance;
+}
+float quadDistance2At(vec2 p, vec2 a, vec2 b, vec2 c, float t) {
+  vec2 delta = a + t * (b + t * c) - p;
+  return dot(delta, delta);
+}
+float signedCbrt(float x) {
+  return sign(x) * pow(abs(x), 0.3333333333333333);
+}
+float sdQuadratic2(vec2 p, vec2 a, vec2 b, vec2 c) {
+  float b2 = dot(b, b);
+  float c2 = dot(c, c);
+  if (c2 <= 1e-10 * b2) {
+    vec2 edge = b + c;
+    float edge2 = dot(edge, edge);
+    if (edge2 == 0.0) return length(p - a);
+    float t = clamp(dot(p - a, edge) / edge2, 0.0, 1.0);
+    return length(p - a - t * edge);
+  }
+  float best = min(quadDistance2At(p, a, b, c, 0.0),
+                   quadDistance2At(p, a, b, c, 1.0));
+  vec2 offset = a - p;
+  float A = 1.5 * dot(b, c) / c2;
+  float B = (0.5 * b2 + dot(offset, c)) / c2;
+  float C = 0.5 * dot(offset, b) / c2;
+  float thirdP = (B - A * A / 3.0) / 3.0;
+  float halfQ = 0.5 * (2.0 * A * A * A / 27.0 - A * B / 3.0 + C);
+  float discriminant = halfQ * halfQ + thirdP * thirdP * thirdP;
+  if (discriminant >= 0.0) {
+    float root = signedCbrt(-halfQ + sqrt(discriminant))
+               + signedCbrt(-halfQ - sqrt(discriminant)) - A / 3.0;
+    if (root > 0.0 && root < 1.0)
+      best = min(best, quadDistance2At(p, a, b, c, root));
+    if (discriminant == 0.0) {
+      root = -0.5 * (root + A / 3.0) - A / 3.0;
+      if (root > 0.0 && root < 1.0)
+        best = min(best, quadDistance2At(p, a, b, c, root));
+    }
+  } else {
+    float radius = sqrt(-thirdP);
+    float angle = acos(clamp(-halfQ / (radius * radius * radius), -1.0, 1.0)) / 3.0;
+    for (int i = 0; i < 3; ++i) {
+      float root = 2.0 * radius * cos(angle - 2.0943951023931953 * float(i)) - A / 3.0;
+      if (root > 0.0 && root < 1.0)
+        best = min(best, quadDistance2At(p, a, b, c, root));
+    }
+  }
+  return sqrt(best);
+}
+float quadraticXAtY(float y, vec2 a, vec2 b, vec2 c, float lo, float hi) {
+  float t;
+  float offset = a.y - y;
+  if (abs(c.y) <= 1e-7 * abs(b.y)) {
+    t = (y - a.y) / b.y;
+  } else {
+    float radical = sqrt(max(b.y * b.y - 4.0 * c.y * offset, 0.0));
+    float q = -0.5 * (b.y + (b.y >= 0.0 ? radical : -radical));
+    float first = q / c.y;
+    float second = abs(q) > 1e-30 ? offset / q : -b.y / (2.0 * c.y);
+    t = first >= lo && first <= hi ? first : second;
+  }
+  t = clamp(t, lo, hi);
+  return a.x + t * (b.x + t * c.x);
+}
+"""
+
+
+def _quadratic_coefficients(segment):
+    a, control, end = segment.points
+    return (
+        a,
+        tuple(2 * (control[i] - a[i]) for i in range(2)),
+        tuple(a[i] - 2 * control[i] + end[i] for i in range(2)),
+    )
+
+
+class _Lowerer:
     def __init__(self):
-        self.lines = []
-        self.cache = {}
+        self.functions = []
+        self.names = {}
 
-    def atom(self, value, dtype):
-        return value if isinstance(value, str) else _literal(value, dtype)
-
-    def emit(self, expression, dtype):
-        typ = _type(dtype)
-        key = (typ, expression)
-        if key in self.cache:
-            return self.cache[key]
-        if len(self.lines) >= _MAX_STATEMENTS:
-            raise ValueError("GLSL scene is too large; simplify geometry or use the JAX viewer")
-        name = f"v{len(self.lines)}"
-        self.lines.append(f"  {typ} {name} = {expression};")
-        self.cache[key] = name
+    def lower(self, node):
+        key = id(node)
+        if key in self.names:
+            return self.names[key]
+        if len(self.names) >= _MAX_NODES:
+            raise ValueError(f"GLSL scene exceeds {_MAX_NODES} shape nodes")
+        children = [self.lower(child) for child in node.children]
+        name = f"shape{len(self.names)}"
+        self.names[key] = name
+        dim = node.dim
+        ptype = f"vec{dim}"
+        lines = self._body(node, children)
+        self.functions.append(
+            f"vec2 {name}({ptype} p) {{\n" + "\n".join(f"  {line}" for line in lines) + "\n}"
+        )
         return name
 
-    def array(self, value):
-        result = np.asarray(value, dtype=object)
-        if result.size > _MAX_ELEMENTS:
-            raise ValueError(f"GLSL geometry arrays are limited to {_MAX_ELEMENTS} elements")
-        return result
-
-    def run(self, closed, inputs):
-        graph = closed.jaxpr if hasattr(closed, "jaxpr") else closed
-        constants = closed.consts if hasattr(closed, "consts") else ()
-        env = dict(zip(graph.constvars, map(self.array, constants), strict=True))
-        env.update(zip(graph.invars, inputs, strict=True))
-
-        def read(var):
-            return self.array(var.val) if hasattr(var, "val") else env[var]
-
-        for equation in graph.eqns:
-            values = [read(var) for var in equation.invars]
-            for var in equation.outvars:
-                if np.prod(var.aval.shape, dtype=int) > _MAX_ELEMENTS:
-                    raise ValueError("GLSL geometry array exceeds the supported size")
-                _type(var.aval.dtype)
-            outputs = self.equation(equation, values)
-            env.update(zip(equation.outvars, outputs, strict=True))
-        return [read(var) for var in graph.outvars]
-
-    def elementwise(self, equation, values):
-        name, params = equation.primitive.name, equation.params
-        output = equation.outvars[0].aval
-        arrays = [np.broadcast_to(value, output.shape) for value in values]
-        result = np.empty(output.shape, dtype=object)
-        input_types = [v.aval.dtype for v in equation.invars]
-        for index in np.ndindex(output.shape):
-            a = [
-                self.atom(value[index], dtype)
-                for value, dtype in zip(arrays, input_types, strict=True)
+    def _body(self, node, children):
+        kind, data = node.kind, node.data
+        child = children[0] if children else None
+        if kind in ("circle", "sphere"):
+            return [f"return vec2(length(p) - {_f(data[0])}, 0.0);"]
+        if kind in ("rectangle", "box"):
+            *sizes, radius = data
+            return [
+                f"return vec2(sdBox{node.dim}(p, {_v(s / 2 for s in sizes)}, {_f(radius)}), 0.0);"
             ]
-            if name in ("add", "sub", "mul", "div", "lt", "le", "gt", "ge", "eq", "ne"):
-                operator = dict(
-                    add="+",
-                    sub="-",
-                    mul="*",
-                    div="/",
-                    lt="<",
-                    le="<=",
-                    gt=">",
-                    ge=">=",
-                    eq="==",
-                    ne="!=",
-                )[name]
-                expr = f"({a[0]} {operator} {a[1]})"
-            elif name in ("min", "max", "pow", "atan2"):
-                expr = f"{'atan' if name == 'atan2' else name}({a[0]}, {a[1]})"
-            elif name in (
-                "abs",
-                "sqrt",
-                "exp",
-                "exp2",
-                "log",
-                "log2",
-                "sin",
-                "cos",
-                "tan",
-                "asin",
-                "acos",
-                "atan",
-                "sinh",
-                "cosh",
-                "tanh",
-                "floor",
-                "ceil",
-                "sign",
-            ):
-                expr = f"{name}({a[0]})"
-            elif name in ("neg", "not"):
-                operator = "-" if name == "neg" else ("!" if _type(output.dtype) == "bool" else "~")
-                expr = f"({operator}{a[0]})"
-            elif name in ("and", "or", "xor"):
-                boolean = _type(output.dtype) == "bool"
-                operator = {
-                    "and": "&&" if boolean else "&",
-                    "or": "||" if boolean else "|",
-                    "xor": "!=" if boolean else "^",
-                }[name]
-                expr = f"({a[0]} {operator} {a[1]})"
-            elif name == "select_n":
-                if len(a) != 3:
-                    raise ValueError("GLSL viewer supports two-way jnp.where selections")
-                condition = (
-                    a[0]
-                    if _type(input_types[0]) == "bool"
-                    else f"({a[0]} != {_literal(0, input_types[0])})"
-                )
-                expr = f"({condition} ? {a[2]} : {a[1]})"
-            elif name in ("square", "integer_pow"):
-                power = 2 if name == "square" else params["y"]
-                if abs(power) > 16:
-                    raise ValueError("GLSL integer powers are limited to magnitude 16")
-                base = " * ".join([a[0]] * abs(power)) or _literal(1, output.dtype)
-                expr = f"({_literal(1, output.dtype)} / ({base}))" if power < 0 else f"({base})"
-            elif name == "convert_element_type":
-                if input_types[0] == output.dtype:
-                    result[index] = arrays[0][index]
-                    continue
-                expr = f"{_type(output.dtype)}({a[0]})"
-            elif name == "rsqrt":
-                expr = f"inversesqrt({a[0]})"
-            elif name == "is_finite":
-                expr = f"(!isnan({a[0]}) && !isinf({a[0]}))"
-            elif name in ("lt_to", "le_to"):
-                op = "<" if name == "lt_to" else "<="
-                if _type(input_types[0]) == "float":
-                    keys = []
-                    for term in a:
-                        bits = self.emit(f"floatBitsToUint({term})", np.uint32)
-                        keys.append(
-                            self.emit(
-                                f"(({bits} & 2147483648u) != 0u ? ~{bits} : ({bits} ^ 2147483648u))",
-                                np.uint32,
-                            )
-                        )
-                    expr = f"({keys[0]} {op} {keys[1]})"
-                else:
-                    expr = f"({a[0]} {op} {a[1]})"
-            elif name == "rem":
-                if _type(output.dtype) == "float":
-                    expr = f"({a[0]} - trunc({a[0]} / {a[1]}) * {a[1]})"
-                else:
-                    expr = f"({a[0]} % {a[1]})"
-            elif name == "clamp":
-                expr = f"clamp({a[1]}, {a[0]}, {a[2]})"
-            else:
-                raise ValueError(
-                    f"GLSL viewer cannot translate JAX operation '{name}'; simplify this field or use the JAX viewer"
-                )
-            result[index] = self.emit(expr, output.dtype)
-        return [result]
-
-    def equation(self, equation, values):
-        name, p = equation.primitive.name, equation.params
-        if equation.effects:
-            raise ValueError("GLSL geometry cannot contain callbacks or side effects")
-        if name in ("jit", "pjit", "closed_call", "custom_jvp_call"):
-            return self.run(p.get("jaxpr", p.get("call_jaxpr")), values)
-        if name == "stop_gradient":
-            return values
-        # Evaluate input-independent work once in Python, preserving JAX dtypes.
-        if all(not any(isinstance(item, str) for item in value.flat) for value in values):
-            inputs = [
-                jnp.asarray(value.tolist(), dtype=var.aval.dtype)
-                for value, var in zip(values, equation.invars, strict=True)
+        if kind == "cylinder":
+            radius, height = data
+            return [
+                f"return vec2(cap2(length(p.xy) - {_f(radius)}, abs(p.z) - {_f(height / 2)}), 0.0);"
             ]
-            try:
-                result = equation.primitive.bind(*inputs, **p)
-                if not equation.primitive.multiple_results:
-                    result = [result]
-                return [self.array(np.asarray(item)) for item in result]
-            except NotImplementedError, TypeError:
-                pass
-        if name == "slice":
-            strides = p["strides"] or (1,) * len(p["start_indices"])
-            slices = tuple(
-                slice(a, b, c)
-                for a, b, c in zip(p["start_indices"], p["limit_indices"], strides, strict=True)
-            )
-            return [values[0][slices]]
-        if name in ("squeeze", "reshape"):
-            value = values[0]
-            if name == "reshape" and p.get("dimensions") is not None:
-                value = value.transpose(p["dimensions"])
-            return [value.reshape(equation.outvars[0].aval.shape)]
-        if name == "transpose":
-            return [values[0].transpose(p["permutation"])]
-        if name == "broadcast_in_dim":
-            shape = [1] * len(p["shape"])
-            for axis, size in zip(p["broadcast_dimensions"], values[0].shape, strict=True):
-                shape[axis] = size
-            return [np.broadcast_to(values[0].reshape(shape), p["shape"])]
-        if name == "stack":
-            return [np.stack(values, axis=p["axis"])]
-        if name in ("argmin", "argmax"):
-            return [self.argreduce(equation, values[0])]
-        if name == "concatenate":
-            return [np.concatenate(values, axis=p["dimension"])]
-        if name.startswith("reduce_"):
-            return [self.reduce(equation, values[0])]
-        if name == "dynamic_slice":
-            return [self.dynamic_slice(equation, values)]
-        if name == "dot_general":
-            return [self.dot(equation, values)]
-        if name == "scan":
-            count = p["length"]
-            if count > _MAX_SCAN:
-                raise ValueError(f"GLSL static loops are limited to {_MAX_SCAN} iterations")
-            body = p["jaxpr"]
-            graph = body.jaxpr if hasattr(body, "jaxpr") else body
-            # New JAX records flattened loop state in ft_in instead of num_carry.
-            if "num_consts" in p:
-                nc, ns = p["num_consts"], p["num_carry"]
-            elif "ft_in" in p:
-                groups = p["ft_in"].unpack()
-                nc, ns = len(groups[0]), len(groups[1])
-            else:
-                raise ValueError("Unsupported JAX scan layout in GLSL geometry")
-            const, carry, xs = values[:nc], values[nc : nc + ns], values[nc + ns :]
-            collected = [[] for _ in graph.outvars[ns:]]
-            indices = range(count - 1, -1, -1) if p["reverse"] else range(count)
-            for i in indices:
-                outputs = self.run(body, const + carry + [value[i] for value in xs])
-                carry = outputs[:ns]
-                for bucket, value in zip(collected, outputs[ns:], strict=True):
-                    bucket.append(value)
-            return carry + [
-                np.stack(bucket[::-1] if p["reverse"] else bucket) for bucket in collected
+        if kind == "torus":
+            major, tube = data
+            return [
+                f"return vec2(length(vec2(length(p.xy) - {_f(major)}, p.z)) - {_f(tube)}, 0.0);"
             ]
-        return self.elementwise(equation, values)
-
-    def argreduce(self, equation, value):
-        axes = equation.params["axes"]
-        if len(axes) != 1:
-            raise ValueError("GLSL argmin/argmax require one axis")
-        axis = axes[0]
-        output = equation.outvars[0].aval
-        dtype = equation.invars[0].aval.dtype
-        result = np.empty(output.shape, dtype=object)
-        for index in np.ndindex(output.shape):
-            selection = list(index)
-            selection.insert(axis, slice(None))
-            terms = list(value[tuple(selection)].flat)
-            best, best_index = self.atom(terms[0], dtype), "0"
-            for i, term in enumerate(terms[1:], 1):
-                term = self.atom(term, dtype)
-                op = "<" if equation.primitive.name == "argmin" else ">"
-                condition = f"({term} {op} {best})"
-                if _type(dtype) == "float":
-                    condition = f"({condition} || (isnan({term}) && !isnan({best})))"
-                condition = self.emit(condition, np.bool_)
-                best = self.emit(f"({condition} ? {term} : {best})", dtype)
-                best_index = self.emit(f"({condition} ? {i} : {best_index})", output.dtype)
-            result[index] = best_index
-        return result
-
-    def reduce(self, equation, value):
-        name, axes = equation.primitive.name, equation.params["axes"]
-        supported = {
-            "reduce_sum": "+",
-            "reduce_prod": "*",
-            "reduce_min": "min",
-            "reduce_max": "max",
-            "reduce_or": "||",
-            "reduce_and": "&&",
-        }
-        if name not in supported:
-            raise ValueError(f"GLSL viewer cannot translate JAX reduction '{name}'")
-        output = equation.outvars[0].aval
-        result = np.empty(output.shape, dtype=object)
-        kept = [axis for axis in range(value.ndim) if axis not in axes]
-        dtype = equation.invars[0].aval.dtype
-        for index in np.ndindex(output.shape):
-            selection = [slice(None)] * value.ndim
-            for axis, coordinate in zip(kept, index, strict=True):
-                selection[axis] = coordinate
-            terms = list(value[tuple(selection)].flat)
-            if not terms:
-                identity = {
-                    "reduce_sum": 0,
-                    "reduce_prod": 1,
-                    "reduce_min": np.inf,
-                    "reduce_max": -np.inf,
-                    "reduce_or": False,
-                    "reduce_and": True,
-                }[name]
-                result[index] = identity
-                continue
-            acc = self.atom(terms[0], dtype)
-            operator = supported[name]
-            for term in terms[1:]:
-                term = self.atom(term, dtype)
-                expr = (
-                    f"{operator}({acc}, {term})"
-                    if operator in ("min", "max")
-                    else f"({acc} {operator} {term})"
-                )
-                acc = self.emit(expr, output.dtype)
-            result[index] = acc
-        return result
-
-    def dynamic_slice(self, equation, values):
-        source, *starts = values
-        sizes = equation.params["slice_sizes"]
-        output = equation.outvars[0].aval
-        starts = [
-            self.atom(value.item(), var.aval.dtype)
-            for value, var in zip(starts, equation.invars[1:], strict=True)
-        ]
-        starts = [
-            self.emit(
-                f"int(clamp({start}, {_literal(0, var.aval.dtype)}, {_literal(size - width, var.aval.dtype)}))",
-                np.int32,
-            )
-            for start, size, width, var in zip(
-                starts, source.shape, sizes, equation.invars[1:], strict=True
-            )
-        ]
-        result = np.empty(sizes, dtype=object)
-        for index in np.ndindex(sizes):
-            choices = list(
-                product(
-                    *(
-                        range(size - width + 1)
-                        for size, width in zip(source.shape, sizes, strict=True)
+        if kind == "capsule":
+            a, b, radius = data
+            return [f"return vec2(sdSegment3(p, {_v(a)}, {_v(b)}) - {_f(radius)}, 0.0);"]
+        if kind == "tube":
+            points, radius = data
+            lines = ["float d = 1e30;"]
+            for a, b in zip(points, points[1:], strict=False):
+                lines.append(f"d = min(d, sdSegment3(p, {_v(a)}, {_v(b)}));")
+            return [*lines, f"return vec2(d - {_f(radius)}, 0.0);"]
+        if kind == "curve_profile":
+            return self._curve_profile(data[0])
+        if kind == "polygon":
+            vertices = data[0]
+            if len(vertices) > _MAX_PROFILE_SEGMENTS:
+                raise ValueError(f"GLSL profiles support at most {_MAX_PROFILE_SEGMENTS} edges")
+            lines = ["float d = 1e30;", "bool inside = false;"]
+            for a, b in zip(vertices, vertices[1:] + vertices[:1], strict=False):
+                lines.append(f"d = min(d, sdSegment2(p, {_v(a)}, {_v(b)}));")
+                if a[1] != b[1]:
+                    lines.append(
+                        f"inside = inside != (({_f(a[1])} > p.y) != ({_f(b[1])} > p.y) && p.x < {_f(a[0])} + (p.y - {_f(a[1])}) * {_f((b[0] - a[0]) / (b[1] - a[1]))});"
                     )
+            return [*lines, "return vec2(inside ? -d : d, 0.0);"]
+        if kind in ("min", "max", "subtract", "smooth_union"):
+            lines = [f"vec2 a = {children[0]}(p);", f"vec2 b = {children[1]}(p);"]
+            if kind == "min":
+                return [*lines, "return a.x < b.x ? a : b;"]
+            if kind == "max":
+                return [*lines, "return a.x > b.x ? a : b;"]
+            if kind == "subtract":
+                return [*lines, "return vec2(max(a.x, -b.x), a.y);"]
+            radius = _f(data[0])
+            return [
+                *lines,
+                f"float h = max({radius} - abs(a.x - b.x), 0.0) / {radius};",
+                f"return vec2(min(a.x, b.x) - h * h * {radius} * 0.25, a.x < b.x ? a.y : b.y);",
+            ]
+        if kind == "translate":
+            return [f"return {child}(p - {_v(data)});"]
+        if kind == "scale":
+            factor = _f(data[0])
+            return [f"vec2 h = {child}(p / {factor});", f"return vec2(h.x * {factor}, h.y);"]
+        if kind == "rotate":
+            angle, axis = data
+            c, s = _f(cos(angle)), _f(sin(angle))
+            if node.dim == 2:
+                mapped = f"vec2({c} * p.x + {s} * p.y, -{s} * p.x + {c} * p.y)"
+            elif axis == "x":
+                mapped = f"vec3(p.x, {c} * p.y + {s} * p.z, -{s} * p.y + {c} * p.z)"
+            elif axis == "y":
+                mapped = f"vec3({c} * p.x - {s} * p.z, p.y, {s} * p.x + {c} * p.z)"
+            else:
+                mapped = f"vec3({c} * p.x + {s} * p.y, -{s} * p.x + {c} * p.y, p.z)"
+            return [f"return {child}({mapped});"]
+        if kind == "transform":
+            transform = data[0]
+            if transform.forward_affine is None:
+                raise ValueError("GLSL lowering requires forward_affine for custom transforms")
+            matrix, translation = transform.forward_affine
+            mapped = _affine_point(_mat_inverse(matrix), translation, "p")
+            return [
+                f"vec2 h = {child}({mapped});",
+                f"return vec2(h.x * {_f(transform.distance_scale)}, h.y);",
+            ]
+        if kind == "offset":
+            return [f"vec2 h = {child}(p);", f"return vec2(h.x - {_f(data[0])}, h.y);"]
+        if kind == "shell":
+            return [f"vec2 h = {child}(p);", f"return vec2(abs(h.x) - {_f(data[0] / 2)}, h.y);"]
+        if kind == "material":
+            return [f"vec2 h = {child}(p);", f"return vec2(h.x, {_f(data[0])});"]
+        if kind == "extrude":
+            height, offset = data
+            return [
+                f"vec2 h = {child}(p.xy);",
+                f"return vec2(cap2(h.x, abs(p.z - {_f(offset)}) - {_f(height / 2)}), h.y);",
+            ]
+        if kind == "variable_extrude":
+            height, offset = data[:2]
+            from .field import coordinates, to_glsl
+
+            x, y = coordinates()[:2]
+            try:
+                height = height(x, y) if callable(height) else height
+                offset = offset(x, y) if callable(offset) else offset
+                height_glsl, offset_glsl = to_glsl(height), to_glsl(offset)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "GLSL extrusion callables must return symbolic scalar fields"
+                ) from exc
+            return [
+                "float x = p.x;",
+                "float y = p.y;",
+                f"vec2 h = {child}(p.xy);",
+                f"return vec2(cap2(h.x, abs(p.z - ({offset_glsl})) - ({height_glsl}) * 0.5), h.y);",
+            ]
+        if kind == "revolve":
+            return [f"return {child}(vec2(length(p.xy), p.z));"]
+        if kind in ("loft", "section_loft"):
+            return self._loft(node, children)
+        if kind == "profile_sweep":
+            return self._sweep(node, child)
+        if kind in ("custom", "python"):
+            from .field import compile_glsl as compile_field_glsl
+            from .field import coordinates, to_glsl
+            from .hit import Hit
+
+            fn, material = data[:2]
+            value = fn(*coordinates()[: node.dim])
+            if isinstance(value, Hit):
+                distance, material = value.distance, value.material
+            else:
+                distance = value
+            coordinate_lines = [f"float {axis} = p.{axis};" for axis in "xyz"[: node.dim]]
+            declarations, result = compile_field_glsl(distance)
+            return [
+                *coordinate_lines,
+                *declarations,
+                f"return vec2({result}, {to_glsl(material)});",
+            ]
+        raise ValueError(f"GLSL lowering does not support shape kind '{kind}'")
+
+    def _curve_profile(self, segments):
+        from .backend import _curve_y_breaks
+
+        if len(segments) > _MAX_PROFILE_SEGMENTS:
+            raise ValueError(f"GLSL profiles support at most {_MAX_PROFILE_SEGMENTS} segments")
+        simple_distances = []
+        bezier_distances = []
+        crossings = []
+        for segment in segments:
+            if segment.kind == "line":
+                a, b = segment.points
+                simple_distances.append(f"d = min(d, sdSegment2(p, {_v(a)}, {_v(b)}));")
+                if a[1] != b[1]:
+                    x = f"{_f(a[0])} + (p.y - {_f(a[1])}) * {_f((b[0] - a[0]) / (b[1] - a[1]))}"
+                    crossings.append(
+                        f"inside = inside != ((({_f(a[1])} > p.y) != ({_f(b[1])} > p.y)) && p.x < {x});"
+                    )
+                continue
+
+            if segment.kind == "arc":
+                center, start, end = segment.points
+                radius = hypot(start[0] - center[0], start[1] - center[1])
+                simple_distances.append(
+                    f"d = min(d, sdArc2(p, {_v(center)}, {_v(start)}, {_v(end)}, {_f(segment.sweep)}));"
                 )
-            )
-            expr = self.atom(
-                source[tuple(a + b for a, b in zip(choices[-1], index, strict=True))], output.dtype
-            )
-            for choice in reversed(choices[:-1]):
-                condition = " && ".join(
-                    f"{start} == {coordinate}"
-                    for start, coordinate in zip(starts, choice, strict=True)
+            elif segment.kind == "quad":
+                coefficients = _quadratic_coefficients(segment)
+                quad_args = ", ".join(_v(value) for value in coefficients)
+                low = tuple(min(point[i] for point in segment.points) for i in range(2))
+                high = tuple(max(point[i] for point in segment.points) for i in range(2))
+                bezier_distances.append(
+                    f"if (length(max(max({_v(low)} - p, p - {_v(high)}), 0.0)) < d) "
+                    f"d = min(d, sdQuadratic2(p, {quad_args}));"
                 )
-                item = source[tuple(a + b for a, b in zip(choice, index, strict=True))]
-                expr = self.emit(
-                    f"({condition} ? {self.atom(item, output.dtype)} : {expr})", output.dtype
+            else:
+                raise ValueError(f"unknown curve segment kind: {segment.kind}")
+
+            breaks = _curve_y_breaks(segment)
+            for lo, hi in zip(breaks, breaks[1:], strict=False):
+                y0, y1 = segment.point(lo)[1], segment.point(hi)[1]
+                if abs(y1 - y0) < 1e-14:
+                    continue
+                if segment.kind == "arc":
+                    side = 1 if segment.point((lo + hi) / 2)[0] >= center[0] else -1
+                    x = (
+                        f"{_f(center[0])} + {_f(side)} * "
+                        f"sqrt(max(0.0, {_f(radius * radius)} - "
+                        f"(p.y - {_f(center[1])}) * (p.y - {_f(center[1])})))"
+                    )
+                else:
+                    x = f"quadraticXAtY(p.y, {quad_args}, {_f(lo)}, {_f(hi)})"
+                crossings.append(
+                    f"inside = inside != ((({_f(y0)} > p.y) != ({_f(y1)} > p.y)) && p.x < {x});"
                 )
-            result[index] = expr
-        return result
+        return [
+            "float d = 1e30;",
+            *simple_distances,
+            *bezier_distances,
+            "bool inside = false;",
+            *crossings,
+            "return vec2(inside ? -d : d, 0.0);",
+        ]
 
-    def dot(self, equation, values):
-        (la, ra), (lb, rb) = equation.params["dimension_numbers"]
-        if lb or rb:
-            raise ValueError("GLSL viewer does not support batched dot products inside fields")
-        left, right = values
-        lf = [i for i in range(left.ndim) if i not in la]
-        rf = [i for i in range(right.ndim) if i not in ra]
-        output = equation.outvars[0].aval
-        result = np.empty(output.shape, dtype=object)
-        for index in np.ndindex(output.shape):
-            li, ri = [0] * left.ndim, [0] * right.ndim
-            for axis, coordinate in zip(lf, index[: len(lf)], strict=True):
-                li[axis] = coordinate
-            for axis, coordinate in zip(rf, index[len(lf) :], strict=True):
-                ri[axis] = coordinate
-            acc = _literal(0, output.dtype)
-            for contract in product(*(range(left.shape[axis]) for axis in la)):
-                for axis, coordinate in zip(la, contract, strict=True):
-                    li[axis] = coordinate
-                for axis, coordinate in zip(ra, contract, strict=True):
-                    ri[axis] = coordinate
-                a = self.atom(left[tuple(li)], equation.invars[0].aval.dtype)
-                b = self.atom(right[tuple(ri)], equation.invars[1].aval.dtype)
-                acc = self.emit(f"({acc} + {a} * {b})", output.dtype)
-            result[index] = acc
-        return result
+    def _loft(self, node, children):
+        stations, (axis, transverse) = node.data
+        ax = "xyz"[axis]
+        u, v = ("xyz"[i] for i in transverse)
+        lines = [f"float z = p.{ax};", f"vec2 uv = p.{u}{v};"]
+        if node.kind == "section_loft":
+            lines += ["vec4 section = vec4(0.0);", "float t;"]
+            for i, (a, b) in enumerate(zip(stations, stations[1:], strict=False)):
+                condition = "if" if i == 0 else "else if"
+                bound = f"z < {_f(b[0])}" if i < len(stations) - 2 else "true"
+                lines += [
+                    f"{condition} ({bound}) {{",
+                    f"  t = clamp((z - {_f(a[0])}) / {_f(b[0] - a[0])}, 0.0, 1.0);",
+                    f"  section = mix({_v(a[1:])}, {_v(b[1:])}, t);",
+                    "}",
+                ]
+            lines += [
+                f"vec2 h = {children[0]}((uv - section.xy) / section.zw);",
+                "h.x *= min(section.z, section.w);",
+            ]
+            first, last = stations[0][0], stations[-1][0]
+        else:
+            lines += ["vec2 h = vec2(1e30, 0.0);", "float t;"]
+            for i, (a, b) in enumerate(zip(stations, stations[1:], strict=False)):
+                condition = "if" if i == 0 else "else if"
+                bound = f"z < {_f(b)}" if i < len(stations) - 2 else "true"
+                lines += [
+                    f"{condition} ({bound}) {{",
+                    f"  t = clamp((z - {_f(a)}) / {_f(b - a)}, 0.0, 1.0);",
+                    f"  vec2 left = {children[i]}(uv);",
+                    f"  vec2 right = {children[i + 1]}(uv);",
+                    "  h = vec2(mix(left.x, right.x, t), t < 0.5 ? left.y : right.y);",
+                    "}",
+                ]
+            first, last = stations[0], stations[-1]
+        lines += [f"h.x = cap2(h.x, max({_f(first)} - z, z - {_f(last)}));", "return h;"]
+        return lines
+
+    def _sweep(self, node, child):
+        from .sweep import _miters
+
+        points, frames, tolerance, closed = node.data
+        if len(frames) > _MAX_SWEEP_SPANS:
+            raise ValueError(f"GLSL sweeps support at most {_MAX_SWEEP_SPANS} sampled spans")
+        start_normals, end_normals = _miters(frames, closed)
+        lines = ["vec2 best = vec2(1e30, 0.0);"]
+        for i, (a, b, frame, ns, ne) in enumerate(
+            zip(points[:-1], points[1:], frames, start_normals, end_normals, strict=True)
+        ):
+            u, v, _ = frame
+            start_pad = tolerance * 0.01 if closed or i else 0.0
+            end_pad = tolerance * 0.01 if closed or i + 1 < len(frames) else 0.0
+            lines += [
+                "{",
+                f"  vec3 r = p - {_v(a)};",
+                f"  vec2 h = {child}(vec2(dot(r, {_v(u)}), dot(r, {_v(v)})));",
+                f"  float cap = max(-dot(r, {_v(ns)}) - {_f(start_pad)}, dot(p - {_v(b)}, {_v(ne)}) - {_f(end_pad)});",
+                "  float d = cap2(h.x, cap);",
+                "  if (d < best.x) best = vec2(d, h.y);",
+                "}",
+            ]
+        lines.append("return best;")
+        return lines
 
 
-def compile_glsl(scene):
-    """Return a shader snippet defining vec2 mapScene(vec3 p): distance, material.
+def compile_glsl(scene, *, bvh=False):
+    """Return GLSL ES 3.00 defining vec2 mapScene(vec3 p).
 
-    Geometry is traced at one float32 point and translated without sampling.
-    Unsupported JAX primitives and oversized static programs raise ValueError.
+    Set bvh to prune certified union components on the GPU.
     """
     if isinstance(scene, Model):
         scene = scene.scene()
     if not isinstance(scene, Shape) or scene.dim != 3:
         raise ValueError("GLSL scene must be a 3D Shape or Model")
-    try:
-        graph = jax.make_jaxpr(scene.sample)(jnp.zeros(3, dtype=jnp.float32))
-        compiler = _Compiler()
-        outputs = compiler.run(graph, [np.asarray(["p.x", "p.y", "p.z"], dtype=object)])
-        if len(outputs) != 2 or any(value.shape for value in outputs):
-            raise ValueError("GLSL geometry must return one distance and one material per point")
-        distance, material = [
-            compiler.atom(value.item(), var.aval.dtype)
-            for value, var in zip(outputs, graph.jaxpr.outvars, strict=True)
-        ]
+    compiler = _Lowerer()
+    if not bvh:
+        root = compiler.lower(scene)
         return "\n".join(
+            [_HELPERS, *compiler.functions, f"vec2 mapScene(vec3 p) {{ return {root}(p); }}"]
+        )
+
+    from .bvh import _build, _certified_box, _union_components
+
+    components = _union_components(scene)
+    certified = [
+        (index, component, _certified_box(component)) for index, component in enumerate(components)
+    ]
+    certified = [(index, component, box) for index, component, box in certified if box is not None]
+    if len(certified) < 4:
+        root = compiler.lower(scene)
+        return "\n".join(
+            [_HELPERS, *compiler.functions, f"vec2 mapScene(vec3 p) {{ return {root}(p); }}"]
+        )
+
+    # Evaluate the first component unconditionally so the initial best value
+    # is exact even when a field exceeds any finite GLSL sentinel.
+    first = compiler.lower(components[0])
+    certified = [(i, shape, box) for i, shape, box in certified if i != 0]
+    certified_ids = {i for i, _, _ in certified}
+    ordinary = [
+        (i, compiler.lower(shape))
+        for i, shape in enumerate(components[1:], 1)
+        if i not in certified_ids
+    ]
+    indexed = {}
+    entries = []
+    for index, shape, box in certified:
+        name = compiler.lower(shape)
+        indexed[id(shape)] = (index, name)
+        center = tuple((a + b) / 2 for a, b in zip(box.minimum, box.maximum, strict=True))
+        entries.append((shape, box, center))
+    tree = _build(entries, 3, 1)
+    bvh_functions = []
+
+    def emit(node):
+        child_names = [emit(child) for child in node.children]
+        name = f"bvh{len(bvh_functions)}"
+        low = _v(
+            float(np.nextafter(np.float32(v), np.float32(-np.inf))) for v in node.bounds.minimum
+        )
+        high = _v(
+            float(np.nextafter(np.float32(v), np.float32(np.inf))) for v in node.bounds.maximum
+        )
+        lines = [
+            f"vec3 lo = {low};",
+            f"vec3 hi = {high};",
+            "if (any(lessThan(p, lo)) || any(greaterThan(p, hi))) {",
+            "  vec3 gap = max(max(lo - p, p - hi), 0.0);",
+            "  if (length(gap) > best.x + 1e-5 * (1.0 + abs(best.x))) return best;",
+            "}",
+        ]
+        if child_names:
+            lines.extend(f"best = {child}(p, best);" for child in child_names)
+        else:
+            for shape in node.shapes:
+                index, shape_name = indexed[id(shape)]
+                lines.extend(
+                    [
+                        f"vec2 h = {shape_name}(p);",
+                        f"if (h.x < best.x || (h.x == best.x && {_f(index)} > best.z)) best = vec3(h, {_f(index)});",
+                    ]
+                )
+        lines.append("return best;")
+        bvh_functions.append(
+            f"vec3 {name}(vec3 p, vec3 best) {{\n"
+            + "\n".join(f"  {line}" for line in lines)
+            + "\n}"
+        )
+        return name
+
+    bvh_root = emit(tree) if entries else None
+    map_lines = [f"vec2 h = {first}(p);", "vec3 best = vec3(h, 0.0);"]
+    for index, shape_name in ordinary:
+        map_lines.extend(
             [
-                "vec2 mapScene(vec3 p) {",
-                *compiler.lines,
-                f"  return vec2(float({distance}), float({material}));",
-                "}",
+                f"h = {shape_name}(p);",
+                f"if (h.x < best.x || (h.x == best.x && {_f(index)} > best.z)) best = vec3(h, {_f(index)});",
             ]
         )
-    except ValueError:
-        raise
-    except Exception as exc:
-        raise ValueError(
-            f"GLSL geometry translation failed: {exc}. Use the JAX viewer for unsupported fields."
-        ) from exc
+    if bvh_root is not None:
+        map_lines.append(f"best = {bvh_root}(p, best);")
+    map_lines.append("return best.xy;")
+    return "\n".join(
+        [
+            _HELPERS,
+            *compiler.functions,
+            *bvh_functions,
+            "vec2 mapScene(vec3 p) {\n" + "\n".join(f"  {line}" for line in map_lines) + "\n}",
+        ]
+    )

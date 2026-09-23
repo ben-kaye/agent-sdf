@@ -1,4 +1,4 @@
-"""Small CAD-like DSL evaluated with JAX."""
+"""Small CAD-like signed distance field language."""
 
 from __future__ import annotations
 
@@ -6,14 +6,16 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from math import atan2, cos, hypot, isfinite, pi, sin, sqrt
 
-import jax.numpy as jnp
+import numpy as np
 
 from .hit import Hit
 from .materials import PALETTE, finish, validate_material_id
-from .transform import Transform, _Pose
+from .transform import Transform, _Pose, _vector_args
 
 
 def _number(value: float) -> float:
+    if np.ndim(value) != 0:
+        raise ValueError("coordinates and dimensions must be scalar")
     value = float(value)
     if not isfinite(value):
         raise ValueError("coordinates and dimensions must be finite")
@@ -28,7 +30,10 @@ def _positive(value: float) -> float:
 
 
 def _point(values: Iterable[float], dim: int) -> tuple[float, ...]:
-    result = tuple(_number(v) for v in values)
+    try:
+        result = tuple(_number(v) for v in values)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"expected {dim} finite coordinates") from exc
     if len(result) != dim:
         raise ValueError(f"expected {dim} coordinates")
     return result
@@ -47,20 +52,17 @@ class Shape:
         return evaluate_shape(self, points)
 
     def __call__(self, *point):
-        if len(point) != self.dim:
+        point = np.asarray(_vector_args(point), dtype=np.float32)
+        if point.shape != (self.dim,):
             raise ValueError(f"expected {self.dim} coordinates")
-        distance, material = self.sample(jnp.asarray(point))
+        distance, material = self.sample(point)
         return Hit(float(distance), int(material))
 
     def sdf(self, *point):
         return self(*point).distance
 
     def bounds(self, scene_bounds=None, *, tolerance=0.01, max_cells=65536):
-        """Conservative AABB; a fallback scene_bounds must enclose the entire shape.
-
-        Custom fields need a supplied Lipschitz bound for adaptive refinement.
-        Otherwise the scene box is retained. Budget exhaustion keeps uncertain cells.
-        """
+        """Return analytic bounds, clipped to scene_bounds when unresolved."""
         from .bounds import shape_bounds
 
         return shape_bounds(self, scene_bounds, tolerance=tolerance, max_cells=max_cells)
@@ -78,10 +80,10 @@ class Shape:
         )
 
     def __or__(self, other: Shape) -> Shape:
-        return union(self, other)
+        return min_(self, other)
 
     def __and__(self, other: Shape) -> Shape:
-        return _binary("intersect", self, other)
+        return max_(self, other)
 
     def __sub__(self, other: Shape) -> Shape:
         return _binary("subtract", self, other)
@@ -91,7 +93,7 @@ class Shape:
         return Shape("smooth_union", self.dim, (_positive(radius),), (self, other))
 
     def translate(self, *offset: float) -> Shape:
-        return Shape("translate", self.dim, _point(offset, self.dim), (self,))
+        return Shape("translate", self.dim, _point(_vector_args(offset), self.dim), (self,))
 
     def rotate(self, angle: float, axis: str = "z") -> Shape:
         if self.dim == 2 and axis != "z":
@@ -136,13 +138,13 @@ class Shape:
     def linear_pattern(self, count: int, *step: float) -> Shape:
         if not isinstance(count, int) or count < 1:
             raise ValueError("pattern count must be a positive integer")
-        delta = _point(step, self.dim)
-        return union(*(self.translate(*(i * x for x in delta)) for i in range(count)))
+        delta = _point(_vector_args(step), self.dim)
+        return min_(*(self.translate(*(i * x for x in delta)) for i in range(count)))
 
     def radial_pattern(self, count: int, axis: str = "z") -> Shape:
         if self.dim != 3 or not isinstance(count, int) or count < 1:
             raise ValueError("radial pattern requires a 3D solid and positive count")
-        return union(*(self.rotate(2 * pi * i / count, axis) for i in range(count)))
+        return min_(*(self.rotate(2 * pi * i / count, axis) for i in range(count)))
 
     def with_material(self, material_id: int) -> Shape:
         if self.dim != 3:
@@ -152,7 +154,7 @@ class Shape:
     def extrude(self, height, *, offset=0.0, bounds=None) -> Shape:
         """Extrude along Z; constant height spans offset +/- height/2 (Z=0 by default).
 
-        Height and offset may be JAX functions of (x, y). Heights are full
+        Height and offset may be symbolic functions of (x, y). Heights are full
         thicknesses; nonpositive values have no interior. Callable fields need
         enclosing 3D bounds for automatic bounds computation.
         Variable extrusion produces an implicit distance estimate.
@@ -243,15 +245,55 @@ def _binary(kind: str, a: Shape, b: Shape) -> Shape:
     return Shape(kind, a.dim, (), (a, b))
 
 
-def union(*shapes: Shape) -> Shape:
-    if not shapes:
-        raise ValueError("union needs at least one shape")
-    if not isinstance(shapes[0], Shape):
-        raise ValueError("union needs Shape operands")
-    result = shapes[0]
-    for shape in shapes[1:]:
-        result = _binary("union", result, shape)
-    return result
+def _field_reduce(kind: str, fields):
+    if len(fields) == 1 and isinstance(fields[0], (list, tuple)):
+        fields = tuple(fields[0])
+    if not fields:
+        raise ValueError(f"{kind}_ needs at least one field")
+    if any(isinstance(field, Shape) for field in fields):
+        if not all(isinstance(field, Shape) for field in fields):
+            raise TypeError("cannot combine shapes and scalar fields")
+        leaves = []
+
+        def collect(shape):
+            if shape.kind == kind:
+                for child in shape.children:
+                    collect(child)
+            else:
+                leaves.append(shape)
+
+        for field in fields:
+            collect(field)
+
+        def balance(first, last):
+            if last - first == 1:
+                return leaves[first]
+            middle = (first + last) // 2
+            return _binary(kind, balance(first, middle), balance(middle, last))
+
+        return balance(0, len(leaves))
+    from .field import Scalar
+
+    if not any(isinstance(field, Scalar) for field in fields):
+        reducer = np.minimum if kind == "min" else np.maximum
+        result = fields[0]
+        for field in fields[1:]:
+            result = reducer(result, field)
+        return result
+    from .field import max_ as scalar_max
+    from .field import min_ as scalar_min
+
+    return (scalar_min if kind == "min" else scalar_max)(*fields)
+
+
+def min_(*fields):
+    """Field-wise minimum (union for signed distance fields)."""
+    return _field_reduce("min", fields)
+
+
+def max_(*fields):
+    """Field-wise maximum (intersection for signed distance fields)."""
+    return _field_reduce("max", fields)
 
 
 def _custom_count(shape: Shape) -> int:
@@ -321,14 +363,14 @@ def capsule(start: Iterable[float], end: Iterable[float], radius: float) -> Shap
 def custom_sdf(
     fn, dim: int = 3, material_id: int = 0, *, bounds=None, lipschitz: float | None = None
 ) -> Shape:
-    """Compose a JAX callable; bounds enclose f <= 0 in local coordinates.
+    """Compose a symbolic distance field; bounds enclose f <= 0 in local coordinates.
 
     lipschitz promises |f(p)-f(q)| <= L*|p-q|; use 1 for a true SDF.
     """
     if dim not in (2, 3):
         raise ValueError("custom SDF dimension must be 2 or 3")
     if not callable(fn):
-        raise ValueError("custom SDF needs a JAX-compatible callable")
+        raise ValueError("custom SDF needs a callable")
     material_id = validate_material_id(material_id)
     from .bounds import as_aabb
 
@@ -347,7 +389,13 @@ class Model:
         self._materials: dict[str, dict] = {}
 
     def material(
-        self, name: str, *, base_color: str, metallic: float = 0.0, roughness: float = 0.8
+        self,
+        name: str,
+        *,
+        base_color: str,
+        metallic: float = 0.0,
+        roughness: float = 0.8,
+        opacity: float = 1.0,
     ) -> int:
         """Define a named finish and return its ID for Shape geometry."""
         if not isinstance(name, str) or not name.isidentifier():
@@ -357,7 +405,7 @@ class Model:
         index = len(PALETTE) + len(self._materials)
         if index > 4095:
             raise ValueError("model cannot define more than 4087 materials")
-        self._materials[name] = {"id": index, **finish(base_color, metallic, roughness)}
+        self._materials[name] = {"id": index, **finish(base_color, metallic, roughness, opacity)}
         return index
 
     def materials(self) -> dict[str, dict]:
@@ -433,8 +481,8 @@ class Model:
         base = self._current if base is None else base
         if base not in self._shapes or tool not in self._shapes:
             raise ValueError("base and tool must name previously defined fields")
-        if op not in ("union", "intersect", "subtract", "smooth_union"):
-            raise ValueError("op must be union, intersect, subtract, or smooth_union")
+        if op not in ("min", "max", "subtract", "smooth_union"):
+            raise ValueError("op must be min, max, subtract, or smooth_union")
         if op != "smooth_union" and radius is not None:
             raise ValueError("radius is only valid for smooth_union")
         a, b = self._shapes[base], self._shapes[tool]
@@ -442,10 +490,10 @@ class Model:
             raise ValueError("base and tool must have the same dimension")
         if a.dim != 3:
             raise ValueError("model result must be 3D")
-        if op == "union":
-            result = a | b
-        elif op == "intersect":
-            result = a & b
+        if op == "min":
+            result = min_(a, b)
+        elif op == "max":
+            result = max_(a, b)
         elif op == "subtract":
             result = a - b
         else:
@@ -504,14 +552,7 @@ class _CurveSegment:
             return tuple(
                 (1 - t) ** 2 * a[i] + 2 * (1 - t) * t * b[i] + t * t * c[i] for i in range(len(a))
             )
-        a, b, c, d = p
-        return tuple(
-            (1 - t) ** 3 * a[i]
-            + 3 * (1 - t) ** 2 * t * b[i]
-            + 3 * (1 - t) * t * t * c[i]
-            + t**3 * d[i]
-            for i in range(len(a))
-        )
+        raise ValueError(f"unknown curve segment kind: {self.kind}")
 
     def derivative(self, t: float) -> tuple[float, ...]:
         p = self.points
@@ -533,16 +574,7 @@ class _CurveSegment:
         if self.kind == "quad":
             a, b, c = p
             return tuple(2 * ((1 - t) * (b[i] - a[i]) + t * (c[i] - b[i])) for i in range(len(a)))
-        a, b, c, d = p
-        return tuple(
-            3
-            * (
-                (1 - t) ** 2 * (b[i] - a[i])
-                + 2 * (1 - t) * t * (c[i] - b[i])
-                + t * t * (d[i] - c[i])
-            )
-            for i in range(len(a))
-        )
+        raise ValueError(f"unknown curve segment kind: {self.kind}")
 
 
 def _cross(a: tuple[float, ...], b: tuple[float, ...]) -> tuple[float, float, float]:
@@ -550,9 +582,10 @@ def _cross(a: tuple[float, ...], b: tuple[float, ...]) -> tuple[float, float, fl
 
 
 class Curve:
-    """2D or 3D piecewise line, Bézier, and 2D circular arc curve."""
+    """2D or 3D piecewise line, quadratic Bézier, and circular arc curve."""
 
     def __init__(self, *start: float):
+        start = _vector_args(start)
         self.dim = len(start)
         if self.dim not in (2, 3):
             raise ValueError("curve start must have two or three coordinates")
@@ -567,7 +600,7 @@ class Curve:
         return value
 
     def line_to(self, *end: float) -> Curve:
-        point = _point(end, self.dim)
+        point = _point(_vector_args(end), self.dim)
         if point != self._end:
             self.segments.append(_CurveSegment("line", (self._end, point)))
             self._end = point
@@ -576,14 +609,6 @@ class Curve:
     def quad_to(self, control: Iterable[float], end: Iterable[float], steps: int = 12) -> Curve:
         control, end = _point(control, self.dim), _point(end, self.dim)
         self.segments.append(_CurveSegment("quad", (self._end, control, end), self._steps(steps)))
-        self._end = end
-        return self
-
-    def cubic_to(
-        self, c1: Iterable[float], c2: Iterable[float], end: Iterable[float], steps: int = 16
-    ) -> Curve:
-        c1, c2, end = _point(c1, self.dim), _point(c2, self.dim), _point(end, self.dim)
-        self.segments.append(_CurveSegment("cubic", (self._end, c1, c2, end), self._steps(steps)))
         self._end = end
         return self
 

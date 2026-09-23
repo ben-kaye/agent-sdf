@@ -4,7 +4,7 @@ import re
 from collections.abc import Mapping
 from math import isfinite
 
-import jax.numpy as jnp
+import numpy as np
 
 PALETTE = (
     (220, 219, 211),
@@ -25,12 +25,12 @@ def validate_material_id(value):
     return value
 
 
-def finish(base_color, metallic=0.0, roughness=0.8):
+def finish(base_color, metallic=0.0, roughness=0.8, opacity=1.0):
     """Validate and normalize one JSON-compatible material finish."""
     if not isinstance(base_color, str) or not re.fullmatch(r"#[0-9a-fA-F]{6}", base_color):
         raise ValueError("material base_color must be a #RRGGBB hex color")
     values = []
-    for label, value in (("metallic", metallic), ("roughness", roughness)):
+    for label, value in (("metallic", metallic), ("roughness", roughness), ("opacity", opacity)):
         try:
             number = float(value)
         except (TypeError, ValueError, OverflowError) as exc:
@@ -38,7 +38,12 @@ def finish(base_color, metallic=0.0, roughness=0.8):
         if not isfinite(number) or not 0 <= number <= 1:
             raise ValueError(f"material {label} must be between 0 and 1")
         values.append(number)
-    return {"base_color": base_color.lower(), "metallic": values[0], "roughness": values[1]}
+    return {
+        "base_color": base_color.lower(),
+        "metallic": values[0],
+        "roughness": values[1],
+        "opacity": values[2],
+    }
 
 
 def normalize_materials(materials):
@@ -63,6 +68,7 @@ def normalize_materials(materials):
                 definition.get("base_color"),
                 definition.get("metallic", 0.0),
                 definition.get("roughness", 0.8),
+                definition.get("opacity", 1.0),
             ),
         }
     return result
@@ -74,16 +80,19 @@ def material_arrays(materials):
     colors = [PALETTE[i % len(PALETTE)] for i in range(count)]
     metallic = [0.0] * count
     roughness = [0.8] * count
+    opacity = [1.0] * count
     for item in definitions.values():
         index = item["id"]
         color = item["base_color"][1:]
         colors[index] = tuple(int(color[i : i + 2], 16) for i in (0, 2, 4))
         metallic[index] = item["metallic"]
         roughness[index] = item["roughness"]
+        opacity[index] = item["opacity"]
     return (
-        jnp.asarray(colors, dtype=jnp.float32),
-        jnp.asarray(metallic, dtype=jnp.float32),
-        jnp.asarray(roughness, dtype=jnp.float32),
+        np.asarray(colors, dtype=np.float32),
+        np.asarray(metallic, dtype=np.float32),
+        np.asarray(roughness, dtype=np.float32),
+        np.asarray(opacity, dtype=np.float32),
     )
 
 

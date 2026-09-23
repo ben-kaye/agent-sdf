@@ -145,7 +145,7 @@
       const offset = vec(camera.eye, camera.target);
       const radius = norm(offset);
       const azimuth = Math.atan2(offset[1], offset[0]) - dx * 0.008;
-      const elevation = Math.max(-1.52, Math.min(1.52, Math.asin(offset[2] / radius) - dy * 0.008));
+      const elevation = Math.max(-1.52, Math.min(1.52, Math.asin(offset[2] / radius) + dy * 0.008));
       camera.eye = [
         camera.target[0] + radius * Math.cos(elevation) * Math.cos(azimuth),
         camera.target[1] + radius * Math.cos(elevation) * Math.sin(azimuth),
@@ -237,7 +237,7 @@
           const label = document.createElement('span');
           label.textContent = name.replaceAll('_', ' ');
           const values = document.createElement('small');
-          values.textContent = `M ${finish.metallic.toFixed(2)} · R ${finish.roughness.toFixed(2)}`;
+          values.textContent = `M ${finish.metallic.toFixed(2)} · R ${finish.roughness.toFixed(2)} · O ${(finish.opacity ?? 1).toFixed(2)}`;
           row.append(swatch, label, values);
           $('finishes').append(row);
         }

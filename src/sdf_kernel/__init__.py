@@ -1,6 +1,5 @@
-"""JAX signed distance geometry."""
+"""Signed distance geometry lowered directly to GLSL."""
 
-from .backend import compile_jax
 from .bounds import AABB
 from .bvh import BVHNode
 from .dsl import (
@@ -14,6 +13,8 @@ from .dsl import (
     custom_sdf,
     cylinder,
     loft,
+    max_,
+    min_,
     polygon,
     rectangle,
     sphere,
@@ -35,10 +36,11 @@ __all__ = [
     "box",
     "capsule",
     "circle",
-    "compile_jax",
     "custom_sdf",
     "cylinder",
     "loft",
+    "max_",
+    "min_",
     "polygon",
     "rectangle",
     "render",

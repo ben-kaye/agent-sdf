@@ -32,6 +32,7 @@ def main():
         help="conservative scene bounds for fields without analytic bounds",
     )
     parser.add_argument("--no-open", action="store_true")
+    parser.add_argument("--bvh", action="store_true", help="prune bounded union components on GPU")
     args = parser.parse_args()
     try:
         if not 1 <= args.port <= 65535:
@@ -59,9 +60,9 @@ def main():
         ):
             bounds = None
         started = perf_counter()
-        shader = compile_glsl(scene).encode()
+        shader = compile_glsl(scene, bvh=args.bvh).encode()
         elapsed = perf_counter() - started
-        colors, metal, rough = material_arrays(materials)
+        colors, metal, rough, opacity = material_arrays(materials)
         config = json.dumps(
             {
                 "name": source.stem.replace("_", " "),
@@ -76,6 +77,7 @@ def main():
                 "palette": colors.tolist(),
                 "metallic": metal.tolist(),
                 "roughness": rough.tolist(),
+                "opacity": opacity.tolist(),
                 "translationMs": round(elapsed * 1000),
             }
         ).encode()

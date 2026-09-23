@@ -9,12 +9,23 @@
     * { box-sizing: border-box; }
     body { margin: 0; min-height: 100vh; color: #eef2f5; background: #151a20; }
     .shell { min-height: 100vh; display: grid; grid-template-rows: auto minmax(0, 1fr) auto; }
-    header, footer { display: flex; align-items: center; gap: 12px; padding: 12px 18px; }
-    header { border-bottom: 1px solid #333c45; }
+    header, footer { display: flex; align-items: center; gap: 12px; padding: 12px 20px; }
+    header { justify-content: space-between; gap: 20px; border-bottom: 1px solid #333c45; background: #1b2229; }
     footer { border-top: 1px solid #333c45; color: #a9b5c0; font-size: 12px; }
-    h1 { font-size: 15px; font-weight: 650; margin: 0; text-transform: capitalize; }
+    .identity { min-width: 0; }
+    .eyebrow { display: block; margin-bottom: 2px; color: #82b7dc; font-size: 10px; font-weight: 750; letter-spacing: .13em; }
+    .scene-line { display: flex; align-items: center; gap: 12px; }
+    h1 { overflow: hidden; max-width: 28ch; font-size: 16px; font-weight: 650; margin: 0; text-overflow: ellipsis; text-transform: capitalize; white-space: nowrap; }
+    .toolbar { display: flex; align-items: center; justify-content: flex-end; gap: 16px; flex-wrap: wrap; }
+    .slider-control { width: 142px; }
+    .slider-label { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; margin-bottom: 4px; color: #b5c1cb; font-size: 11px; }
+    .slider-label output { color: #f1f5f8; font-variant-numeric: tabular-nums; font-weight: 650; }
+    input[type="range"] { display: block; width: 100%; height: 18px; margin: 0; accent-color: #8bc7ef; cursor: pointer; }
+    input[type="range"]:disabled { cursor: not-allowed; opacity: .38; }
+    .slider-control:has(input:disabled) .slider-label { opacity: .5; }
+    .actions { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
     details { position: relative; }
-    summary { cursor: pointer; color: #bdcbd6; }
+    summary { cursor: pointer; color: #bdcbd6; font-size: 12px; }
     .finishes { position: absolute; z-index: 2; top: 28px; left: 0; min-width: 220px;
                 padding: 10px; border: 1px solid #46525f; border-radius: 8px; background: #222b34;
                 box-shadow: 0 12px 28px #0007; }
@@ -22,11 +33,10 @@
     .swatch { width: 18px; height: 18px; border: 1px solid #ffffff44; border-radius: 4px; }
     .finish small { color: #a9b5c0; margin-left: auto; }
     .grow { flex: 1; }
-    select { background: #222b34; color: inherit; border: 1px solid #46525f; padding: 7px; border-radius: 7px; }
     button { appearance: none; border: 1px solid #46525f; border-radius: 7px; background: #222b34;
              color: inherit; padding: 7px 10px; font: inherit; cursor: pointer; }
     button:hover { background: #33414d; }
-    button:focus-visible, .stage:focus-visible { outline: 2px solid #77bbec; outline-offset: 2px; }
+    button:focus-visible, summary:focus-visible, input:focus-visible, .stage:focus-visible { outline: 2px solid #77bbec; outline-offset: 2px; }
     .stage-wrap { min-height: 0; display: grid; place-items: center; padding: 24px; }
     .stage { width: min(100%, calc((100vh - 174px) * 4 / 3)); aspect-ratio: 4 / 3;
              position: relative; background: #e8e8e2; border-radius: 10px; overflow: hidden;
@@ -35,38 +45,62 @@
     .stage canvas { width: 100%; height: 100%; display: block; object-fit: fill; pointer-events: none; }
     .stage::after { content: ""; position: absolute; inset: 0; pointer-events: none;
                     border: 1px solid #ffffff24; border-radius: inherit; }
-    .hint { position: absolute; top: 12px; left: 12px; padding: 6px 9px;
+    .hint { position: absolute; left: 14px; bottom: 14px; padding: 6px 9px;
             border-radius: 5px; color: #293039; background: #ffffffe8; font-size: 12px; }
     .status { display: inline-flex; align-items: center; gap: 7px; }
     .dot { width: 7px; height: 7px; border-radius: 50%; background: #75c58a; }
     .busy .dot { background: #e9bd69; }
     .error .dot { background: #ef7979; }
+    .fps { min-width: 58px; color: #d3e7f5; font-variant-numeric: tabular-nums; }
     .camera { font-family: ui-monospace, SFMono-Regular, monospace; }
     .embed header, .embed footer { display: none; }
     .embed .stage-wrap { padding: 0; }
     .embed .stage { width: 100%; max-width: none; height: 100vh; border-radius: 0; }
     .embed .hint { display: none; }
+    @media (max-width: 1050px) {
+      header { align-items: flex-start; flex-direction: column; gap: 12px; }
+      .toolbar { justify-content: flex-start; width: 100%; }
+    }
     @media (max-width: 650px) {
-      header { flex-wrap: wrap; }
-      header .grow { flex-basis: 100%; }
+      header { padding: 12px; }
+      .toolbar { gap: 10px 18px; }
+      .slider-control { width: min(142px, calc((100vw - 42px) / 2)); }
+      .actions { width: 100%; }
+      button { padding: 7px 8px; font-size: 12px; }
       footer { flex-wrap: wrap; }
       .camera { display: none; }
-      .stage-wrap { padding: 8px; }
+      .stage-wrap { place-items: start center; padding: 16px 8px; }
       .stage { width: 100%; }
+      .hint { left: 8px; bottom: 8px; font-size: 10px; }
     }
   </style>
 </head>
 <body>
   <div class="shell">
     <header>
-      <h1 id="name">SDF Viewer</h1>
-      <details id="materials" hidden><summary>Materials</summary><div class="finishes" id="finishes"></div></details>
-      <span class="grow"></span>
-      <label for="quality">Quality</label><select id="quality"><option value="0.6">Fast</option><option value="1" selected>Balanced</option><option value="1.5">Fine</option></select>
-      <button id="projection" title="Switch projection">Perspective</button>
-      <button id="reset" title="Reset camera">Reset view</button>
-      <button id="download" title="Save the current image">Save PNG</button>
-      <button id="copy" title="Copy camera coordinates">Copy camera</button>
+      <div class="identity">
+        <span class="eyebrow">GLSL VIEWER</span>
+        <div class="scene-line">
+          <h1 id="name">SDF Viewer</h1>
+          <details id="materials" hidden><summary>Materials</summary><div class="finishes" id="finishes"></div></details>
+        </div>
+      </div>
+      <div class="toolbar">
+        <div class="slider-control">
+          <div class="slider-label"><label for="fov">Field of view</label><output id="fov-value" for="fov">40°</output></div>
+          <input id="fov" type="range" min="1" max="120" step="1" value="40" aria-label="Field of view in degrees">
+        </div>
+        <div class="slider-control">
+          <div class="slider-label"><label for="resolution">Resolution</label><output id="resolution-value" for="resolution">100%</output></div>
+          <input id="resolution" type="range" min="50" max="150" step="10" value="100" aria-label="Render resolution percentage">
+        </div>
+        <div class="actions">
+          <button id="projection" title="Switch projection">Perspective</button>
+          <button id="reset" title="Reset camera">Reset view</button>
+          <button id="download" title="Save the current image">Save PNG</button>
+          <button id="copy" title="Copy camera coordinates">Copy camera</button>
+        </div>
+      </div>
     </header>
     <main class="stage-wrap">
       <div class="stage" id="stage" tabindex="0" aria-label="3D model viewer. Left drag to orbit, right drag to pan, scroll to zoom.">
@@ -76,16 +110,28 @@
     </main>
     <footer>
       <span class="status busy" id="status"><span class="dot"></span><span id="status-text">Loading scene…</span></span>
-      <span id="metrics"></span><span class="grow"></span><span class="camera" id="camera"></span>
+      <span id="metrics"></span><span class="fps" id="fps" title="Render updates per second while interacting">FPS idle</span><span class="grow"></span><span class="camera" id="camera"></span>
     </footer>
   </div>
+  <script>
+    function reportStartupError(message) {
+      document.getElementById('status').className = 'status error';
+      document.getElementById('status-text').textContent = message;
+    }
+    window.addEventListener('error', event => reportStartupError(event.message || 'Viewer startup failed.'));
+    window.addEventListener('unhandledrejection', event =>
+      reportStartupError(event.reason?.message || String(event.reason)));
+  </script>
   <script>
     if (new URLSearchParams(location.search).has('embed')) document.body.classList.add('embed');
     const $ = (id) => document.getElementById(id);
     const stage = $('stage');
     const image = $('image');
     let initial, camera, previousFov = 40;
-    let drag = null, settledTimer = null, scheduled = false, fullFrame = true;
+    const refinementScales = [0.4, 0.65, 0.85, 1];
+    let drag = null, settledTimer = null, frameRequest = null, refinementStep = 3, renderRevision = 0;
+    let canvasIntersecting = false;
+    let frameTimes = [], fpsIdleTimer = null;
     let gl, program, uniforms, ready = false, sceneSource, configData;
     let timerExtension, gpuQuery = null;
     let compileMs = 0;
@@ -103,6 +149,7 @@
     uniform highp sampler2D uMaterials;
     uniform int uMaterialCount;
     uniform bool uHasMaterials;
+    uniform bool uFinal;
     out vec4 outColor;
     void main() {
       vec3 forward = normalize(uTarget - uEye);
@@ -116,7 +163,7 @@
       vec3 origin = ortho ? uEye + displacement : uEye;
       vec3 ray = ortho ? forward : normalize(forward + displacement);
       float sky = 1.0 - gl_FragCoord.y / uResolution.y;
-      vec3 color = (vec3(244,244,240) - vec3(24,21,16) * sky) / 255.0;
+      vec3 background = (vec3(244,244,240) - vec3(24,21,16) * sky) / 255.0;
       float near = 0.0, far = uFar;
       if (uHasBounds) {
         float padding = max(0.01, 0.0001 * length(uBoundsMax - uBoundsMin));
@@ -125,7 +172,7 @@
         for (int axis = 0; axis < 3; axis++) {
           if (abs(ray[axis]) < 1e-7) {
             if (origin[axis] < lo[axis] || origin[axis] > hi[axis]) {
-              outColor = vec4(color, 1); return;
+              outColor = vec4(background, 1); return;
             }
           } else {
             float a = (lo[axis] - origin[axis]) / ray[axis];
@@ -134,19 +181,27 @@
             far = min(far, max(a, b));
           }
         }
-        if (far < near) { outColor = vec4(color, 1); return; }
+        if (far < near) { outColor = vec4(background, 1); return; }
       }
       float travel = near;
-      vec2 hit = vec2(0);
-      bool found = false;
-      for (int i = 0; i < 160; i++) {
-        hit = mapScene(origin + travel * ray);
+      vec3 composed = vec3(0);
+      float transmission = 1.0;
+      bool escaping = false;
+      int layers = 0;
+      for (int i = 0; i < 256; i++) {
+        vec2 hit = mapScene(origin + travel * ray);
         if (isnan(hit.x) || isinf(hit.x)) break;
-        if (hit.x < 0.001) { found = true; break; }
-        travel += max(hit.x * 0.75, 0.0005);
-        if (travel > far) break;
-      }
-      if (found) {
+        if (escaping) {
+          travel += max(abs(hit.x) * 0.75, 0.002);
+          escaping = hit.x < 0.004;
+          if (travel > far) break;
+          continue;
+        }
+        if (hit.x >= 0.001) {
+          travel += max(hit.x * 0.75, 0.0005);
+          if (travel > far) break;
+          continue;
+        }
         vec3 p = origin + travel * ray;
         vec2 e = vec2(0.002, 0);
         vec3 gradient = vec3(
@@ -157,19 +212,45 @@
         vec3 light = normalize(vec3(0.55,-0.45,0.7));
         float diffuse = max(0.0, dot(normal, light));
         float rim = max(0.0, dot(normal, -ray));
-        float level = min(1.0, 0.24 + 0.66 * diffuse + 0.10 * rim);
+        float ambient = 1.0;
+        float visibility = 1.0;
+        if (uFinal) {
+          float occlusion = 0.0;
+          float probe = mapScene(p + normal * 0.06).x;
+          occlusion += 0.5 * max(0.06 - probe, 0.0) / 0.06;
+          probe = mapScene(p + normal * 0.16).x;
+          occlusion += 0.3 * max(0.16 - probe, 0.0) / 0.16;
+          probe = mapScene(p + normal * 0.35).x;
+          occlusion += 0.2 * max(0.35 - probe, 0.0) / 0.35;
+          ambient = clamp(1.0 - 0.7 * occlusion, 0.45, 1.0);
+          float shadowTravel = 0.02;
+          for (int j = 0; j < 24; j++) {
+            float shadowDistance = mapScene(p + normal * 0.01 + light * shadowTravel).x;
+            visibility = min(visibility, clamp(10.0 * shadowDistance / shadowTravel, 0.0, 1.0));
+            shadowTravel += max(shadowDistance * 0.75, 0.025);
+            if (shadowTravel > uFar || visibility < 0.02) break;
+          }
+        }
+        float level = min(1.0, 0.24 * ambient + 0.66 * diffuse * visibility + 0.10 * rim);
         int material = ((int(hit.y) % uMaterialCount) + uMaterialCount) % uMaterialCount;
         vec4 finish = texelFetch(uMaterials, ivec2(material, 0), 0);
-        float rough = texelFetch(uMaterials, ivec2(material, 1), 0).r;
-        color = finish.rgb * level;
+        vec4 surface = texelFetch(uMaterials, ivec2(material, 1), 0);
+        float rough = surface.r;
+        vec3 color = finish.rgb * level;
         if (uHasMaterials) {
           vec3 halfVector = normalize(light - ray);
           float gloss = pow(max(0.0, dot(normal, halfVector)), 2.0 / max(rough*rough, 0.025));
           float highlight = gloss * (0.10 + 0.28 * finish.a) * (1.0 - 0.35 * rough);
           color = min(vec3(1), color + highlight * mix(vec3(1), finish.rgb, finish.a));
         }
+        composed += transmission * surface.g * color;
+        transmission *= 1.0 - surface.g;
+        layers++;
+        if (layers >= 4 || transmission <= 1.0 / 255.0) break;
+        travel += 0.002;
+        escaping = true;
       }
-      outColor = vec4(color, 1);
+      outColor = vec4(composed + transmission * background, 1);
     }`;
 
     function compileShader(type, source) {
@@ -181,7 +262,7 @@
     async function initGL() {
       ready = false;
       gl = image.getContext('webgl2', { alpha: false, antialias: false, preserveDrawingBuffer: true });
-      if (!gl) throw new Error('WebGL2 is unavailable. Enable browser graphics acceleration or use the JAX viewer.');
+      if (!gl) throw new Error('WebGL2 is unavailable. Enable browser graphics acceleration.');
       status('Compiling scene on GPU…', 'busy');
       const started = performance.now();
       const parallel = gl.getExtension('KHR_parallel_shader_compile');
@@ -205,7 +286,7 @@
       gl.deleteShader(vert); gl.deleteShader(frag);
       gl.useProgram(program);
       gl.bindVertexArray(gl.createVertexArray());
-      uniforms = Object.fromEntries(['Resolution','Eye','Target','Up','Fov','CameraSize','Far','BoundsMin','BoundsMax','HasBounds','Materials','MaterialCount','HasMaterials']
+      uniforms = Object.fromEntries(['Resolution','Eye','Target','Up','Fov','CameraSize','Far','BoundsMin','BoundsMax','HasBounds','Materials','MaterialCount','HasMaterials','Final']
         .map(name => [name, gl.getUniformLocation(program, 'u' + name)]));
       gl.uniform1i(uniforms.HasBounds, !!configData.bounds);
       if (configData.bounds) {
@@ -217,6 +298,7 @@
       configData.palette.forEach((color, i) => {
         pixels.set([...color.map(v => v / 255), configData.metallic[i]], i * 4);
         pixels[count * 4 + i * 4] = configData.roughness[i];
+        pixels[count * 4 + i * 4 + 1] = configData.opacity[i];
       });
       gl.activeTexture(gl.TEXTURE0);
       gl.bindTexture(gl.TEXTURE_2D, gl.createTexture());
@@ -228,9 +310,10 @@
       gl.uniform1i(uniforms.Materials, 0);
       gl.uniform1i(uniforms.MaterialCount, count);
       gl.uniform1i(uniforms.HasMaterials, Object.keys(configData.materials).length > 0);
+      gl.uniform1i(uniforms.Final, !!configData.final);
       compileMs = performance.now() - started;
       ready = true;
-      queueRender(true);
+      queueRender(document.body.classList.contains('embed'));
     }
     function pollGpu() {
       if (!gpuQuery || !ready) return;
@@ -258,9 +341,9 @@
       return far;
     }
     function draw() {
-      if (!ready) return;
-      const quality = Number($('quality').value) * (fullFrame ? 1 : 0.65);
-      const width = Math.max(1, Math.min(1920, Math.round(stage.clientWidth * quality)));
+      if (!ready || !isCanvasVisible()) return;
+      const scale = Number($('resolution').value) / 100 * refinementScales[refinementStep];
+      const width = Math.max(1, Math.min(4096, Math.round(stage.clientWidth * scale)));
       const height = Math.max(1, Math.round(width * stage.clientHeight / stage.clientWidth));
       if (image.width !== width || image.height !== height) { image.width = width; image.height = height; }
       gl.viewport(0, 0, width, height);
@@ -275,17 +358,42 @@
         gl.beginQuery(timerExtension.TIME_ELAPSED_EXT, gpuQuery.query);
       }
       gl.drawArrays(gl.TRIANGLES, 0, 3);
+      const now = performance.now();
+      frameTimes.push(now);
+      while (frameTimes[0] < now - 2000) frameTimes.shift();
+      const span = now - frameTimes[0];
+      $('fps').textContent = span >= 500 && frameTimes.length > 1 ?
+        `FPS ${Math.round((frameTimes.length - 1) * 1000 / span)}` : 'FPS —';
+      clearTimeout(fpsIdleTimer);
+      fpsIdleTimer = setTimeout(() => {
+        frameTimes = [];
+        $('fps').textContent = 'FPS idle';
+      }, 2500);
       if (measure) { gl.endQuery(timerExtension.TIME_ELAPSED_EXT); setTimeout(pollGpu, 100); }
       if (!timerExtension) $('metrics').textContent = `${width} × ${height} · GPU timing unavailable`;
       status(`WebGL2 · GPU compile ${(compileMs / 1000).toFixed(2)} s`);
     }
     image.addEventListener('webglcontextlost', event => {
       event.preventDefault(); ready = false; gpuQuery = null;
+      pauseRendering(); renderRevision++;
       status('Graphics context lost. Waiting for recovery…', 'error');
     });
     image.addEventListener('webglcontextrestored', () => initGL().catch(error => status(error.message, 'error')));
-    new ResizeObserver(() => queueRender(true)).observe(stage);
-    $('quality').onchange = () => queueRender(true);
+    new ResizeObserver(() => queueRender(document.body.classList.contains('embed'))).observe(stage);
+    new IntersectionObserver(entries => {
+      canvasIntersecting = entries[0].isIntersecting;
+      if (isCanvasVisible()) queueRender(true);
+      else pauseRendering();
+    }).observe(image);
+    document.addEventListener('visibilitychange', () => {
+      if (isCanvasVisible()) queueRender(true);
+      else pauseRendering();
+    });
+    $('resolution').oninput = () => {
+      $('resolution-value').textContent = `${$('resolution').value}%`;
+      queueRender();
+    };
+    $('resolution').onchange = () => queueRender(true);
 
     function status(message, kind = '') {
       $('status').className = `status ${kind}`;
@@ -332,27 +440,50 @@
     function updateCameraText() {
       $('camera').textContent = `Eye ${camera.eye.map(x => x.toFixed(2)).join(', ')} · Target ${camera.target.map(x => x.toFixed(2)).join(', ')}`;
       $('projection').textContent = camera.fov === 0 ? 'Orthographic' : 'Perspective';
+      $('fov').disabled = camera.fov === 0;
+      $('fov').value = camera.fov || previousFov;
+      $('fov-value').textContent = `${camera.fov || previousFov}°`;
+    }
+    function isCanvasVisible() {
+      if (document.hidden || !canvasIntersecting) return false;
+      const rect = image.getBoundingClientRect();
+      return rect.width > 0 && rect.height > 0 && rect.bottom > 0 && rect.right > 0 &&
+        rect.top < innerHeight && rect.left < innerWidth && getComputedStyle(image).visibility === 'visible';
+    }
+    function pauseRendering() {
+      clearTimeout(settledTimer);
+      if (frameRequest !== null) cancelAnimationFrame(frameRequest);
+      frameRequest = null;
+    }
+    function scheduleDraw() {
+      if (frameRequest !== null || !isCanvasVisible()) return;
+      frameRequest = requestAnimationFrame(() => {
+        frameRequest = null;
+        if (!isCanvasVisible()) { pauseRendering(); return; }
+        const revision = renderRevision;
+        try { draw(); } catch (error) { status(error.message, 'error'); return; }
+        if (!ready || revision !== renderRevision || refinementStep === refinementScales.length - 1) return;
+        settledTimer = setTimeout(() => {
+          if (revision !== renderRevision) return;
+          refinementStep++;
+          scheduleDraw();
+        }, refinementStep === 0 ? 160 : 120);
+      });
     }
     function queueRender(full = false) {
       if (!camera || !ready) return;
       clearTimeout(settledTimer);
-      fullFrame = full;
+      renderRevision++;
+      refinementStep = full ? refinementScales.length - 1 : 0;
       updateCameraText();
-      if (!scheduled) {
-        scheduled = true;
-        requestAnimationFrame(() => {
-          scheduled = false;
-          try { draw(); } catch (error) { status(error.message, 'error'); }
-        });
-      }
-      if (!full) settledTimer = setTimeout(() => queueRender(true), 180);
+      scheduleDraw();
     }
     function orbit(dx, dy) {
       const offset = vec(camera.eye, camera.target);
       const radius = norm(offset);
       const azimuth = Math.atan2(offset[1], offset[0]) - dx * 0.008;
       const elevation = Math.max(-Math.PI / 2 + 1e-4,
-        Math.min(Math.PI / 2 - 1e-4, Math.asin(offset[2] / radius) - dy * 0.008));
+        Math.min(Math.PI / 2 - 1e-4, Math.asin(offset[2] / radius) + dy * 0.008));
       camera.eye = [
         camera.target[0] + radius * Math.cos(elevation) * Math.cos(azimuth),
         camera.target[1] + radius * Math.cos(elevation) * Math.sin(azimuth),
@@ -389,7 +520,6 @@
       if (!drag) return;
       drag = null;
       stage.classList.remove('dragging');
-      queueRender(true);
     }
     stage.addEventListener('pointerup', endDrag);
     stage.addEventListener('pointercancel', endDrag);
@@ -398,7 +528,7 @@
       if (!ready || !['ArrowLeft','ArrowRight','ArrowUp','ArrowDown'].includes(event.key)) return;
       event.preventDefault();
       orbit(event.key === 'ArrowLeft' ? -12 : event.key === 'ArrowRight' ? 12 : 0,
-        event.key === 'ArrowUp' ? -12 : event.key === 'ArrowDown' ? 12 : 0);
+        event.key === 'ArrowUp' ? 12 : event.key === 'ArrowDown' ? -12 : 0);
       queueRender();
     });
     stage.addEventListener('contextmenu', event => event.preventDefault());
@@ -414,6 +544,13 @@
       }
       queueRender();
     }, { passive: false });
+    $('fov').oninput = () => {
+      if (!camera || camera.fov === 0) return;
+      camera.fov = Number($('fov').value);
+      previousFov = camera.fov;
+      queueRender();
+    };
+    $('fov').onchange = () => queueRender();
     $('projection').onclick = () => {
       if (!ready) return;
       const radius = norm(vec(camera.eye, camera.target));
@@ -423,12 +560,21 @@
         camera.cameraSize = 2 * radius * Math.tan(camera.fov * Math.PI / 360);
         camera.fov = 0;
       }
-      queueRender(true);
+      queueRender();
     };
-    $('reset').onclick = () => { if (!ready) return; camera = structuredClone(initial); queueRender(true); };
+    $('reset').onclick = () => {
+      if (!ready) return;
+      camera = structuredClone(initial);
+      previousFov = camera.fov || 40;
+      queueRender();
+    };
     $('download').onclick = () => {
       if (!ready) return;
-      fullFrame = true; draw();
+      if (!isCanvasVisible()) { status('Bring the canvas into view to save PNG'); return; }
+      pauseRendering();
+      renderRevision++;
+      refinementStep = refinementScales.length - 1;
+      draw();
       image.toBlob(blob => {
         if (!blob) return;
         const url = URL.createObjectURL(blob);
@@ -449,18 +595,26 @@
       } catch { status('Clipboard unavailable in this browser', 'error'); }
     };
     async function fetchResource(path, json = false) {
-      const response = await fetch(path);
-      if (!response.ok) throw new Error(`Could not load ${path}: ${response.status}`);
-      return json ? response.json() : response.text();
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 15000);
+      try {
+        const response = await fetch(path, { signal: controller.signal });
+        if (!response.ok) throw new Error(`Could not load ${path}: ${response.status}`);
+        return await (json ? response.json() : response.text());
+      } catch (error) {
+        if (controller.signal.aborted) throw new Error(`Loading ${path} timed out. Reload to retry.`);
+        throw error;
+      } finally {
+        clearTimeout(timeout);
+      }
     }
     Promise.all([fetchResource('config', true), fetchResource('scene.glsl')]).then(async ([config, shader]) => {
       configData = config; sceneSource = shader;
       initial = { ...config, orientation: initialOrientation(config) };
       camera = structuredClone(initial);
       previousFov = config.fov || 40;
-      $('name').textContent = config.name;
       document.title = `${config.name} · GLSL Viewer`;
-      $('name').textContent = config.name + ' · GLSL';
+      $('name').textContent = config.name;
       const finishes = Object.entries(config.materials || {});
       if (finishes.length) {
         $('materials').hidden = false;
@@ -473,7 +627,7 @@
           const label = document.createElement('span');
           label.textContent = name.replaceAll('_', ' ');
           const values = document.createElement('small');
-          values.textContent = `M ${finish.metallic.toFixed(2)} · R ${finish.roughness.toFixed(2)}`;
+          values.textContent = `M ${finish.metallic.toFixed(2)} · R ${finish.roughness.toFixed(2)} · O ${(finish.opacity ?? 1).toFixed(2)}`;
           row.append(swatch, label, values);
           $('finishes').append(row);
         }

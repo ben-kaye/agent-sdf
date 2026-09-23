@@ -1,28 +1,44 @@
-"""JAX ray marcher for signed distance scenes."""
+"""Render GLSL signed distance scenes to PNG through headless WebGL2."""
+
+from __future__ import annotations
 
 import argparse
+import base64
+import io
 import json
+import os
 import runpy
+import shutil
 import sys
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from math import isfinite
 from pathlib import Path
 
-import jax
-import jax.numpy as jnp
 import numpy as np
 from PIL import Image
+from playwright.sync_api import Error as PlaywrightError
+from playwright.sync_api import sync_playwright
 
-from .bvh import compile_bvh_sample
-from .dsl import Model, Shape, _custom_count
+from .dsl import Model, Shape
+from .glsl import compile_glsl
 from .materials import material_arrays, scene_materials
 from .smaa import smaa
+from .transform import _vector3
 
 
-def _unit(v):
-    length = jnp.linalg.norm(v, axis=-1, keepdims=True)
-    if bool(jnp.any(length == 0)):
-        raise ValueError("camera vectors cannot have zero length")
-    return v / length
+def _chrome():
+    candidates = (
+        os.environ.get("SDF_CHROME"),
+        shutil.which("google-chrome"),
+        shutil.which("chromium"),
+        shutil.which("chromium-browser"),
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    )
+    for candidate in candidates:
+        if candidate and Path(candidate).is_file():
+            return candidate
+    raise ValueError("PNG rendering requires Chrome or Chromium (or set SDF_CHROME)")
 
 
 def _fxaa(image):
@@ -65,37 +81,94 @@ def _fxaa(image):
     return np.where(edge[..., None], blended, rgb).astype(np.uint8)
 
 
-def _adaptive_edges(image, hit, travel, material):
-    """Select both sides of visible color, silhouette, material, and depth edges."""
-    edges = np.zeros(hit.shape, dtype=bool)
+def _config(scene, materials, eye, target, fov, camera_size, far, final):
+    bounds = None
+    try:
+        box = scene.bounds()
+        if not box.is_empty and all(isfinite(x) for x in (*box.minimum, *box.maximum)):
+            bounds = (box.minimum, box.maximum)
+    except ValueError:
+        pass
+    palette, metallic, roughness, opacity = material_arrays(materials)
+    return {
+        "name": "render",
+        "materials": materials,
+        "eye": eye,
+        "target": target,
+        "fov": fov,
+        "cameraSize": camera_size,
+        "far": far,
+        "autoFar": False,
+        "final": final,
+        "bounds": bounds,
+        "palette": palette.tolist(),
+        "metallic": metallic.tolist(),
+        "roughness": roughness.tolist(),
+        "opacity": opacity.tolist(),
+    }
 
-    def mark(a, b, first, second):
-        color = np.max(np.abs(a.astype(np.int16) - b.astype(np.int16)), axis=-1) > 12
-        silhouette = first[0] != second[0]
-        surfaces = first[0] & second[0]
-        materials = surfaces & (first[2] != second[2])
-        depth = surfaces & (
-            np.abs(first[1] - second[1]) > np.maximum(0.02, 0.05 * np.minimum(first[1], second[1]))
-        )
-        return color | silhouette | materials | depth
 
-    horizontal = mark(
-        image[:, :-1],
-        image[:, 1:],
-        (hit[:, :-1], travel[:, :-1], material[:, :-1]),
-        (hit[:, 1:], travel[:, 1:], material[:, 1:]),
-    )
-    edges[:, :-1] |= horizontal
-    edges[:, 1:] |= horizontal
-    vertical = mark(
-        image[:-1],
-        image[1:],
-        (hit[:-1], travel[:-1], material[:-1]),
-        (hit[1:], travel[1:], material[1:]),
-    )
-    edges[:-1] |= vertical
-    edges[1:] |= vertical
-    return edges
+def _render_webgl(shader, config, width, height):
+    html = Path(__file__).with_name("glsl_viewer.html").read_bytes()
+    resources = {
+        "/": (html, "text/html; charset=utf-8"),
+        "/config": (json.dumps(config).encode(), "application/json"),
+        "/scene.glsl": (shader.encode(), "text/plain; charset=utf-8"),
+    }
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            resource = resources.get(self.path.split("?", 1)[0])
+            if resource is None:
+                self.send_error(404)
+                return
+            body, content_type = resource
+            self.send_response(200)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        try:
+            with sync_playwright() as playwright:
+                browser = playwright.chromium.launch(
+                    executable_path=_chrome(),
+                    headless=True,
+                    args=["--enable-unsafe-swiftshader", "--disable-gpu-sandbox"],
+                )
+                try:
+                    page = browser.new_page(viewport={"width": width, "height": height})
+                    page.goto(f"http://127.0.0.1:{server.server_port}/?embed", wait_until="load")
+                    page.wait_for_function(
+                        "() => !document.querySelector('#status').classList.contains('busy')",
+                        timeout=90000,
+                    )
+                    if "error" in (page.locator("#status").get_attribute("class") or ""):
+                        raise ValueError(page.locator("#status-text").inner_text())
+                    data_url = page.locator("#image").evaluate(
+                        "canvas => canvas.toDataURL('image/png')"
+                    )
+                    image = Image.open(io.BytesIO(base64.b64decode(data_url.split(",", 1)[1])))
+                    if image.size != (width, height):
+                        raise ValueError(
+                            f"headless WebGL returned {image.size}, expected {(width, height)}"
+                        )
+                    return image.convert("RGB")
+                finally:
+                    browser.close()
+        except PlaywrightError as exc:
+            raise ValueError(f"headless WebGL rendering failed: {exc}") from exc
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
 
 
 def render(
@@ -111,224 +184,45 @@ def render(
     materials=None,
     final=False,
     aa="auto",
-    bvh=True,
+    bvh=False,
 ):
-    """Render a 3D scene with full, adaptive, or postprocess antialiasing."""
+    """Render a scene with the same GLSL program used by the browser viewer."""
     if isinstance(scene, Model):
         materials = scene_materials(scene, materials)
         scene = scene.scene()
+    else:
+        materials = scene_materials(None, materials)
     if not isinstance(scene, Shape) or scene.dim != 3:
         raise ValueError("render needs a 3D Shape or Model")
     if not 1 <= width <= 2048 or not 1 <= height <= 2048:
         raise ValueError("width and height must be from 1 to 2048")
-    if not isfinite(camera_size) or camera_size <= 0:
-        raise ValueError("camera_size must be finite and positive")
-    if not isfinite(far) or far <= 0:
-        raise ValueError("far must be finite and positive")
     if aa not in ("auto", "none", "fxaa", "smaa", "ssaa", "adaptive"):
-        raise ValueError("aa must be auto, none, fxaa, smaa, ssaa, or adaptive")
-    aa_mode = ("ssaa" if final else "none") if aa == "auto" else aa
-    if not isfinite(fov) or (fov != 0 and not 1 <= fov <= 120):
+        raise ValueError("invalid antialiasing mode")
+    if fov != 0 and not 1 <= fov <= 120:
         raise ValueError("fov must be zero or between 1 and 120 degrees")
-    orthographic = fov == 0
-
-    eye = np.asarray(eye, dtype=np.float32)
-    target = np.asarray(target, dtype=np.float32)
-    if eye.shape != (3,) or target.shape != (3,):
-        raise ValueError("eye and target must have three coordinates")
-    if not np.all(np.isfinite(eye)) or not np.all(np.isfinite(target)):
-        raise ValueError("eye and target must be finite")
-    if np.array_equal(eye, target):
-        raise ValueError("eye and target must be distinct")
-    eye = jnp.asarray(eye)
-    target = jnp.asarray(target)
-    forward = _unit(target - eye)
-    horizontal = float(jnp.linalg.norm(forward[:2]))
-    right = (
-        jnp.asarray((forward[1] / horizontal, -forward[0] / horizontal, 0))
-        if horizontal > 1e-8
-        else jnp.asarray((1.0, 0.0, 0.0))
+    eye, target = _vector3(eye, "eye"), _vector3(target, "target")
+    if not all(isfinite(v) for v in (fov, far, camera_size)):
+        raise ValueError("camera values must be finite")
+    if sum((a - b) ** 2 for a, b in zip(eye, target, strict=True)) < 1e-8:
+        raise ValueError("eye and target must be distinct 3D points")
+    if far <= 0 or camera_size <= 0:
+        raise ValueError("far and camera size must be positive")
+    mode = ("ssaa" if final else "none") if aa == "auto" else aa
+    scale = 2 if mode in ("ssaa", "adaptive") else 1
+    shader = compile_glsl(scene, bvh=bvh)
+    image = _render_webgl(
+        shader,
+        _config(scene, materials, tuple(eye), tuple(target), fov, camera_size, far, final),
+        width * scale,
+        height * scale,
     )
-    up = jnp.cross(right, forward)
-    spread = camera_size / 2 if orthographic else jnp.tan(jnp.deg2rad(fov) / 2)
-    scale = 2 if aa_mode == "ssaa" else 1
-    tile_limit = (
-        96
-        if final or aa_mode in ("fxaa", "smaa", "adaptive")
-        else 16
-        if _custom_count(scene) >= 8
-        else 32
-    )
-    tile_height, tile_width = min(height, tile_limit), min(width, tile_limit)
-    raster_height, raster_width = tile_height * scale, tile_width * scale
-    light = jnp.asarray((0.55, -0.45, 0.7), dtype=jnp.float32)
-    light = light / jnp.linalg.norm(light)
-    palette, metal, rough = material_arrays(materials)
-    sample = (
-        compile_bvh_sample(scene, np.asarray(target))
-        if bvh
-        else lambda points, active=None: scene.sample(points)
-    )
-
-    def trace(rows, cols, shade_scale):
-        sample_shape = rows.shape
-        sx = (2 * (cols + 0.5) / width - 1) * spread * width / height
-        sy = (1 - 2 * (rows + 0.5) / height) * spread
-        displacement = sx[..., None] * right + sy[..., None] * up
-        origin = eye + displacement if orthographic else jnp.broadcast_to(eye, sample_shape + (3,))
-        direction = forward + displacement
-        ray = (
-            jnp.broadcast_to(forward, origin.shape)
-            if orthographic
-            else direction / jnp.maximum(jnp.linalg.norm(direction, axis=-1, keepdims=True), 1e-12)
-        )
-        travel = jnp.zeros(sample_shape, dtype=jnp.float32)
-        hit = jnp.zeros(sample_shape, dtype=bool)
-        material = jnp.zeros(sample_shape, dtype=jnp.int32)
-        active = jnp.ones(sample_shape, dtype=bool)
-
-        def step(state):
-            count, travel, hit, material, active = state
-            p = origin + travel[..., None] * ray
-            distance, sampled_material = sample(p, active)
-            found = active & (distance < 0.001)
-            hit = hit | found
-            material = jnp.where(found, sampled_material.astype(jnp.int32), material)
-            next_travel = travel + jnp.maximum(distance * 0.75, 0.0005)
-            travel = jnp.where(active & ~found, next_travel, travel)
-            active = active & ~found & (travel <= far)
-            return count + 1, travel, hit, material, active
-
-        def marching(state):
-            count, _, _, _, active = state
-            return (count < 96) & jnp.any(active)
-
-        _, travel, hit, material, _ = jax.lax.while_loop(
-            marching, step, (0, travel, hit, material, active)
-        )
-        shade = ((rows + 0.5) * shade_scale - 0.5) / max(height * shade_scale - 1, 1)
-        background = jnp.stack((244 - 24 * shade, 244 - 21 * shade, 240 - 16 * shade), axis=-1)
-
-        def shade_hits():
-            p = origin + travel[..., None] * ray
-            offsets = jnp.eye(3, dtype=jnp.float32) * 0.002
-            gradients = []
-            for axis in range(3):
-                positive, _ = sample(p + offsets[axis], hit)
-                negative, _ = sample(p - offsets[axis], hit)
-                gradients.append(positive - negative)
-            normal = jnp.stack(gradients, axis=-1)
-            normal = normal / jnp.maximum(jnp.linalg.norm(normal, axis=-1, keepdims=True), 1e-12)
-            diffuse = jnp.maximum(0, jnp.sum(normal * light, axis=-1))
-            rim = jnp.maximum(0, jnp.sum(normal * -ray, axis=-1))
-            if final:
-                occlusion = jnp.zeros_like(diffuse)
-                for radius, weight in ((0.06, 0.5), (0.16, 0.3), (0.35, 0.2)):
-                    distance, _ = sample(p + normal * radius, hit)
-                    occlusion += weight * jnp.maximum(radius - distance, 0) / radius
-                ambient = jnp.clip(1 - 0.7 * occlusion, 0.45, 1)
-
-                shadow_origin = p + normal * 0.01
-
-                def shadow_step(_, state):
-                    distance_along, visibility = state
-                    distance, _ = sample(shadow_origin + distance_along[..., None] * light, hit)
-                    visibility = jnp.minimum(
-                        visibility,
-                        jnp.clip(10 * distance / jnp.maximum(distance_along, 0.01), 0, 1),
-                    )
-                    distance_along += jnp.maximum(distance * 0.75, 0.025)
-                    return distance_along, visibility
-
-                _, shadow = jax.lax.fori_loop(
-                    0, 16, shadow_step, (jnp.full_like(diffuse, 0.03), jnp.ones_like(diffuse))
-                )
-                shadow = jnp.clip(shadow, 0.3, 1)
-                level = jnp.minimum(1, 0.24 * ambient + 0.66 * diffuse * shadow + 0.10 * rim)
-            else:
-                shadow = 1
-                level = jnp.minimum(1, 0.24 + 0.66 * diffuse + 0.10 * rim)
-            finish = material % len(palette)
-            base = palette[finish]
-            shaded = base * level[..., None]
-            if materials:
-                half_vector = light - ray
-                half_vector = half_vector / jnp.maximum(
-                    jnp.linalg.norm(half_vector, axis=-1, keepdims=True), 1e-12
-                )
-                gloss = jnp.maximum(0, jnp.sum(normal * half_vector, axis=-1)) ** (
-                    2 / jnp.maximum(rough[finish] ** 2, 0.025)
-                )
-                highlight = (
-                    gloss * (0.10 + 0.28 * metal[finish]) * (1 - 0.35 * rough[finish]) * shadow
-                )
-                specular_color = (
-                    255 * (1 - metal[finish][..., None]) + base * metal[finish][..., None]
-                )
-                shaded = jnp.minimum(255, shaded + highlight[..., None] * specular_color)
-            return jnp.where(hit[..., None], shaded, background).astype(jnp.uint8)
-
-        rgb = jax.lax.cond(jnp.any(hit), shade_hits, lambda: background.astype(jnp.uint8))
-        return rgb, hit, travel, material
-
-    def trace_tile(row_start, col_start):
-        rows, cols = jnp.meshgrid(
-            row_start + (jnp.arange(raster_height) + 0.5) / scale - 0.5,
-            col_start + (jnp.arange(raster_width) + 0.5) / scale - 0.5,
-            indexing="ij",
-        )
-        return trace(rows, cols, scale)
-
-    trace_tile = jax.jit(trace_tile)
-    image = np.empty((height, width, 3), dtype=np.uint8)
-    if aa_mode == "adaptive":
-        hits = np.empty((height, width), dtype=bool)
-        depths = np.empty((height, width), dtype=np.float32)
-        material_ids = np.empty((height, width), dtype=np.int32)
-    for row in range(0, height, tile_height):
-        for col in range(0, width, tile_width):
-            samples, hit, travel, material = trace_tile(row, col)
-            samples = np.asarray(samples)
-            pixels = (
-                samples.reshape(tile_height, scale, tile_width, scale, 3).mean(axis=(1, 3))
-                if scale == 2
-                else samples
-            )
-            valid_height = min(tile_height, height - row)
-            valid_width = min(tile_width, width - col)
-            region = np.s_[row : row + valid_height, col : col + valid_width]
-            image[region] = pixels[:valid_height, :valid_width]
-            if aa_mode == "adaptive":
-                hits[region] = np.asarray(hit)[:valid_height, :valid_width]
-                depths[region] = np.asarray(travel)[:valid_height, :valid_width]
-                material_ids[region] = np.asarray(material)[:valid_height, :valid_width]
-    if aa_mode == "adaptive":
-        edge_rows, edge_cols = np.nonzero(_adaptive_edges(image, hits, depths, material_ids))
-        trace_edges = jax.jit(lambda rows, cols: trace(rows, cols, 2)[0])
-        offsets_row = np.array((-0.25, -0.25, 0.25, 0.25), dtype=np.float32)
-        offsets_col = np.array((-0.25, 0.25, -0.25, 0.25), dtype=np.float32)
-        batch_size = 512
-        for start in range(0, len(edge_rows), batch_size):
-            end = min(start + batch_size, len(edge_rows))
-            count = end - start
-            rows = np.repeat(edge_rows[start:end].astype(np.float32), 4) + np.tile(
-                offsets_row, count
-            )
-            cols = np.repeat(edge_cols[start:end].astype(np.float32), 4) + np.tile(
-                offsets_col, count
-            )
-            if count < batch_size:
-                rows = np.pad(rows, (0, 4 * (batch_size - count)), mode="edge")
-                cols = np.pad(cols, (0, 4 * (batch_size - count)), mode="edge")
-            samples = trace_edges(jnp.asarray(rows), jnp.asarray(cols))
-            image[edge_rows[start:end], edge_cols[start:end]] = (
-                np.asarray(samples)[: 4 * count].reshape(count, 4, 3).mean(axis=1)
-            )
-    if aa_mode == "fxaa":
-        image = _fxaa(image)
-    elif aa_mode == "smaa":
-        image = smaa(image)
-    return Image.fromarray(image, "RGB")
+    if scale > 1:
+        image = image.resize((width, height), Image.Resampling.LANCZOS)
+    elif mode == "smaa":
+        image = Image.fromarray(smaa(np.asarray(image)), "RGB")
+    elif mode == "fxaa":
+        image = Image.fromarray(_fxaa(np.asarray(image)), "RGB")
+    return image
 
 
 def main():
@@ -342,19 +236,10 @@ def main():
     parser.add_argument("--fov", type=float, default=40)
     parser.add_argument("--camera-size", type=float, default=2.0)
     parser.add_argument("--far", type=float, default=20)
+    parser.add_argument("--final", action="store_true")
+    parser.add_argument("--bvh", action="store_true", help="prune bounded union components on GPU")
     parser.add_argument(
-        "--final",
-        action="store_true",
-        help="ambient occlusion, soft shadows, and 2x antialiasing by default",
-    )
-    parser.add_argument(
-        "--aa",
-        choices=("auto", "none", "fxaa", "smaa", "ssaa", "adaptive"),
-        default="auto",
-        help="antialiasing; smaa is single-frame, adaptive traces edge rays, auto uses 2x SSAA with --final",
-    )
-    parser.add_argument(
-        "--no-bvh", dest="bvh", action="store_false", help="disable BVH render pruning"
+        "--aa", choices=("auto", "none", "fxaa", "smaa", "ssaa", "adaptive"), default="auto"
     )
     args = parser.parse_args()
     source = Path(args.source).resolve()

@@ -1,18 +1,28 @@
-"""Reusable JAX coordinate transforms for signed distance fields."""
+"""Reusable coordinate transforms for signed distance fields."""
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from math import cos, isfinite, sin, sqrt
 
-import jax
-import jax.numpy as jnp
+import numpy as np
 
 
 def _finite(value: float) -> float:
+    if np.ndim(value) != 0:
+        raise ValueError("transform values must be scalar")
     result = float(value)
     if not isfinite(result):
         raise ValueError("transform values must be finite")
     return result
+
+
+def _vector_args(values):
+    if len(values) == 1 and not isinstance(values[0], (str, bytes)):
+        try:
+            return tuple(values[0])
+        except TypeError:
+            pass
+    return values
 
 
 def _vector3(value, name):
@@ -111,8 +121,8 @@ class _Pose:
         return cls(translation, rotation)
 
     def as_transform(self):
-        translation = jnp.asarray(self.translation, dtype=jnp.float32)
-        rotation = jnp.asarray(self.rotation, dtype=jnp.float32)
+        translation = np.asarray(self.translation, dtype=float)
+        rotation = np.asarray(self.rotation, dtype=float)
         return Transform(
             3,
             lambda point: rotation.T @ (point - translation),
@@ -136,7 +146,7 @@ class _Pose:
 class Transform:
     """A point map from world coordinates into primitive local coordinates.
 
-    `inverse` receives one JAX point of shape `(dim,)` and returns the same
+    `inverse` receives one point of shape `(dim,)` and returns the same
     shape. `distance_scale` converts local distances to world distances; a
     nonlinear map needs a conservative scale for safe sphere tracing.
     `forward_affine`, when supplied, promises the matching local-to-world
@@ -148,7 +158,6 @@ class Transform:
     distance_scale: float = 1.0
     forward_affine: tuple[tuple[tuple[float, ...], ...], tuple[float, ...]] | None = None
     _single: Callable = field(init=False, repr=False, compare=False)
-    _batch: Callable = field(init=False, repr=False, compare=False)
 
     def __post_init__(self):
         if self.dim not in (2, 3):
@@ -176,24 +185,20 @@ class Transform:
                 )
             object.__setattr__(self, "forward_affine", (matrix, translation))
 
-        def single(point):
-            return jnp.asarray(self.inverse(point), dtype=jnp.float32)
-
         try:
-            result = jax.eval_shape(single, jax.ShapeDtypeStruct((self.dim,), jnp.float32))
+            result = np.asarray(self.inverse(np.zeros(self.dim, dtype=float)), dtype=float)
         except Exception as exc:
-            raise ValueError(f"inverse map must be JAX traceable: {exc}") from exc
+            raise ValueError(f"inverse map must accept a numeric point: {exc}") from exc
         if result.shape != (self.dim,):
             raise ValueError(f"inverse map must return a point of shape ({self.dim},)")
-        object.__setattr__(self, "_single", jax.jit(single))
-        object.__setattr__(self, "_batch", jax.jit(jax.vmap(single)))
+        object.__setattr__(self, "_single", self.inverse)
 
     @classmethod
     def translation(cls, *offset: float) -> Transform:
-        values = tuple(_finite(value) for value in offset)
+        values = tuple(_finite(value) for value in _vector_args(offset))
         if len(values) not in (2, 3):
             raise ValueError("translation needs two or three coordinates")
-        delta = jnp.asarray(values, dtype=jnp.float32)
+        delta = np.asarray(values, dtype=float)
         identity = tuple(
             tuple(float(i == j) for j in range(len(values))) for i in range(len(values))
         )
@@ -201,10 +206,10 @@ class Transform:
 
     @classmethod
     def scaling(cls, *factors: float) -> Transform:
-        values = tuple(_finite(value) for value in factors)
+        values = tuple(_finite(value) for value in _vector_args(factors))
         if len(values) not in (2, 3) or any(value == 0 for value in values):
             raise ValueError("scaling needs two or three nonzero factors")
-        factors_array = jnp.asarray(values, dtype=jnp.float32)
+        factors_array = np.asarray(values, dtype=float)
         return cls(
             len(values),
             lambda point: point / factors_array,
@@ -227,24 +232,24 @@ class Transform:
         if dim == 2:
             return cls(
                 2,
-                lambda p: jnp.stack((c * p[0] + s * p[1], -s * p[0] + c * p[1])),
+                lambda p: np.stack((c * p[0] + s * p[1], -s * p[0] + c * p[1])),
                 forward_affine=(((c, -s), (s, c)), (0.0, 0.0)),
             )
         if axis == "x":
             return cls(
                 3,
-                lambda p: jnp.stack((p[0], c * p[1] + s * p[2], -s * p[1] + c * p[2])),
+                lambda p: np.stack((p[0], c * p[1] + s * p[2], -s * p[1] + c * p[2])),
                 forward_affine=(((1.0, 0.0, 0.0), (0.0, c, -s), (0.0, s, c)), (0.0, 0.0, 0.0)),
             )
         if axis == "y":
             return cls(
                 3,
-                lambda p: jnp.stack((c * p[0] - s * p[2], p[1], s * p[0] + c * p[2])),
+                lambda p: np.stack((c * p[0] - s * p[2], p[1], s * p[0] + c * p[2])),
                 forward_affine=(((c, 0.0, s), (0.0, 1.0, 0.0), (-s, 0.0, c)), (0.0, 0.0, 0.0)),
             )
         return cls(
             3,
-            lambda p: jnp.stack((c * p[0] + s * p[1], -s * p[0] + c * p[1], p[2])),
+            lambda p: np.stack((c * p[0] + s * p[1], -s * p[0] + c * p[1], p[2])),
             forward_affine=(((c, -s, 0.0), (s, c, 0.0), (0.0, 0.0, 1.0)), (0.0, 0.0, 0.0)),
         )
 
@@ -276,24 +281,26 @@ class Transform:
             forward_affine=affine,
         )
 
-    def map_jax(self, points):
+    def map_points(self, points):
         """Map one point or any batch with a final coordinate axis."""
-        points = jnp.asarray(points, dtype=jnp.float32)
+        points = np.asarray(points, dtype=float)
         if points.ndim < 1 or points.shape[-1] != self.dim:
             raise ValueError(f"points must end in {self.dim} coordinates")
+        if self.forward_affine is not None:
+            matrix, offset = self.forward_affine
+            inverse = np.linalg.inv(np.asarray(matrix, dtype=float))
+            return (points - np.asarray(offset, dtype=float)) @ inverse.T
         if points.ndim == 1:
-            return self._single(points)
-        return self._batch(points.reshape((-1, self.dim))).reshape(points.shape)
-
-    def map_points(self, points):
-        """Map an `(N, dim)` point array with JAX vmap."""
-        points = jnp.asarray(points, dtype=jnp.float32)
-        if points.ndim != 2 or points.shape[1] != self.dim:
-            raise ValueError(f"points must have shape (N, {self.dim})")
-        return self._batch(points)
+            return np.asarray(self._single(points), dtype=float)
+        return np.asarray(
+            [self._single(point) for point in points.reshape(-1, self.dim)], dtype=float
+        ).reshape(points.shape)
 
     def map_python(self, *point: float) -> tuple[float, ...]:
-        result = self.map_jax(jnp.asarray(point, dtype=jnp.float32))
+        point = np.asarray(_vector_args(point), dtype=float)
+        if point.shape != (self.dim,):
+            raise ValueError(f"point must have {self.dim} coordinates")
+        result = self.map_points(point)
         values = tuple(float(value) for value in result)
         if not all(isfinite(value) for value in values):
             raise ValueError("inverse map returned nonfinite coordinates")

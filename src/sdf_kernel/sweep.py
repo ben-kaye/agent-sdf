@@ -5,9 +5,9 @@ from __future__ import annotations
 from itertools import product
 from math import isfinite, sqrt
 
-import jax.numpy as jnp
+import numpy as np
 
-from .dsl import Curve, Shape
+from .dsl import Curve, Shape, _point
 
 
 def _dot(a, b):
@@ -64,9 +64,7 @@ def _frames(points, up, closed):
             if abs(_dot(axis, first)) < 0.9
         )
     else:
-        candidate = tuple(float(x) for x in up)
-        if len(candidate) != 3 or not all(isfinite(x) for x in candidate):
-            raise ValueError("up must have three finite coordinates")
+        candidate = _point(up, 3)
     projection = tuple(candidate[i] - _dot(candidate, first) * first[i] for i in range(3))
     if _dot(projection, projection) < 1e-24:
         raise ValueError("up must not be parallel to the initial curve tangent")
@@ -139,37 +137,37 @@ def sweep(profile: Shape, curve: Curve, *, tolerance=0.01, up=None, closed=False
 
 
 def evaluate_sweep(node, q, evaluate):
-    """Evaluate the union of mitered swept spans for a JAX point array."""
+    """Evaluate the union of mitered swept spans for a NumPy point array."""
     points, frames = node.data[:2]
     tolerance = node.data[2]
     closed = node.data[3]
     start_normals, end_normals = _miters(frames, closed)
-    origins = jnp.asarray(points[:-1])
-    basis_u = jnp.asarray([frame[0] for frame in frames])
-    basis_v = jnp.asarray([frame[1] for frame in frames])
+    origins = np.asarray(points[:-1])
+    basis_u = np.asarray([frame[0] for frame in frames])
+    basis_v = np.asarray([frame[1] for frame in frames])
     relative = q[..., None, :] - origins
-    local = jnp.stack(
-        (jnp.sum(relative * basis_u, axis=-1), jnp.sum(relative * basis_v, axis=-1)), axis=-1
+    local = np.stack(
+        (np.sum(relative * basis_u, axis=-1), np.sum(relative * basis_v, axis=-1)), axis=-1
     )
     profile_distance, material = evaluate(node.children[0], local)
     overlap = tolerance * 0.01
-    start_pad = jnp.asarray([overlap if closed or i else 0.0 for i in range(len(frames))])
-    end_pad = jnp.asarray(
+    start_pad = np.asarray([overlap if closed or i else 0.0 for i in range(len(frames))])
+    end_pad = np.asarray(
         [overlap if closed or i + 1 < len(frames) else 0.0 for i in range(len(frames))]
     )
-    start = -jnp.sum(relative * jnp.asarray(start_normals), axis=-1) - start_pad
+    start = -np.sum(relative * np.asarray(start_normals), axis=-1) - start_pad
     end = (
-        jnp.sum((q[..., None, :] - jnp.asarray(points[1:])) * jnp.asarray(end_normals), axis=-1)
+        np.sum((q[..., None, :] - np.asarray(points[1:])) * np.asarray(end_normals), axis=-1)
         - end_pad
     )
-    cap = jnp.maximum(start, end)
+    cap = np.maximum(start, end)
     # Exact prism combination for a straight span. At bends the same formula
     # keeps the correct solid sign, though its magnitude is only an estimate.
-    outside = jnp.sqrt(jnp.maximum(profile_distance, 0) ** 2 + jnp.maximum(cap, 0) ** 2)
-    distance = outside + jnp.minimum(jnp.maximum(profile_distance, cap), 0)
-    selected = jnp.argmin(distance, axis=-1)
-    minimum = jnp.min(distance, axis=-1)
-    chosen_material = jnp.take_along_axis(material, selected[..., None], axis=-1)[..., 0]
+    outside = np.sqrt(np.maximum(profile_distance, 0) ** 2 + np.maximum(cap, 0) ** 2)
+    distance = outside + np.minimum(np.maximum(profile_distance, cap), 0)
+    selected = np.argmin(distance, axis=-1)
+    minimum = np.min(distance, axis=-1)
+    chosen_material = np.take_along_axis(material, selected[..., None], axis=-1)[..., 0]
     return minimum, chosen_material
 
 

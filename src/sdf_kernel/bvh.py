@@ -6,10 +6,7 @@ from dataclasses import dataclass
 from math import inf, isfinite
 from typing import TYPE_CHECKING
 
-import jax
-import jax.numpy as jnp
-
-from .bounds import AABB, _analytic, _sublevel_growth
+from .bounds import AABB
 
 if TYPE_CHECKING:
     from .dsl import Shape
@@ -35,7 +32,7 @@ def _union_components(shape: Shape) -> list[Shape]:
     pending = [(shape, ())]
     while pending:
         current, wrappers = pending.pop()
-        if current.kind == "union":
+        if current.kind == "min":
             pending.extend((child, wrappers) for child in reversed(current.children))
         elif current.kind in distributive:
             pending.append((current.children[0], (*wrappers, current)))
@@ -44,6 +41,28 @@ def _union_components(shape: Shape) -> list[Shape]:
                 current = Shape(wrapper.kind, wrapper.dim, wrapper.data, (current,))
             components.append(current)
     return components
+
+
+def _certified_box(shape: Shape):
+    """Return a box when distance to it is a lower bound outside it.
+
+    This deliberately excludes custom fields and distance estimates: a bound
+    on their zero set does not bound their field value at a query point.
+    """
+    if shape.kind in {"sphere", "box", "cylinder", "torus", "capsule", "tube"}:
+        pass
+    elif shape.kind in {"translate", "rotate", "scale", "material"}:
+        if _certified_box(shape.children[0]) is None:
+            return None
+    else:
+        return None
+    try:
+        box = shape.bounds()
+    except ValueError:
+        return None
+    if box.is_empty or not all(isfinite(x) for x in box.minimum + box.maximum):
+        return None
+    return box
 
 
 def _enclose(boxes: list[AABB]) -> AABB:
@@ -101,103 +120,74 @@ def build_bvh(
 
 
 def compile_bvh_sample(shape: Shape, reference_point=None):
-    """Exact union sampling with tile-wide conditional subtree evaluation."""
-    components = _union_components(shape)
-    bounded, fallback = [], []
-    ranks, growths = {}, {}
-    for rank, component in enumerate(components):
-        ranks[id(component)] = rank
-        box = _analytic(component)
-        growth = _sublevel_growth(component)
-        if (
-            box.is_empty
-            or growth is None
-            or not all(isfinite(x) for x in box.minimum + box.maximum)
-            or not all(isfinite(x) and x > 0 for x in growth)
-        ):
-            fallback.append(component)
-            continue
-        growths[id(component)] = growth
-        center = tuple(lo / 2 + hi / 2 for lo, hi in zip(box.minimum, box.maximum, strict=True))
-        bounded.append((component, box, center))
+    """Return a NumPy sampler that prunes certified union components."""
+    import numpy as np
 
-    if not bounded or len(components) == 1:
+    components = _union_components(shape)
+    certified = [
+        (i, component, _certified_box(component)) for i, component in enumerate(components)
+    ]
+    certified = [(i, component, box) for i, component, box in certified if box is not None]
+    if len(certified) < 4:
         return lambda points, active=None: shape.sample(points)
 
-    root = _build(bounded, shape.dim, 1)
-    reference = (0.0,) * shape.dim if reference_point is None else tuple(reference_point)
-
-    def prepare(node):
-        children = tuple(
-            prepare(child)
-            for child in sorted(
-                node.children,
-                key=lambda child: sum(
-                    max(lo - p, p - hi, 0.0) ** 2
-                    for lo, hi, p in zip(
-                        child.bounds.minimum, child.bounds.maximum, reference, strict=True
-                    )
-                ),
-            )
-        )
-        growth = (
-            growths[id(node.shapes[0])]
-            if node.is_leaf
-            else tuple(max(child[1][axis] for child in children) for axis in range(shape.dim))
-        )
-        return node, growth, children
-
-    tree = prepare(root)
+    indexed = {id(component): i for i, component, _ in certified if i != 0}
+    entries = []
+    for i, component, box in certified:
+        if i == 0:
+            continue
+        center = tuple((a + b) / 2 for a, b in zip(box.minimum, box.maximum, strict=True))
+        entries.append((component, box, center))
+    tree = _build(entries, shape.dim, 1)
+    indexed_ids = set(indexed.values())
+    ordinary = [
+        (i, component) for i, component in enumerate(components[1:], 1) if i not in indexed_ids
+    ]
 
     def sample(points, active=None):
-        points = jnp.asarray(points)
-        active = jnp.ones(points.shape[:-1], dtype=bool) if active is None else active
-        state = (
-            jnp.full(points.shape[:-1], jnp.inf, dtype=points.dtype),
-            jnp.zeros(points.shape[:-1], dtype=jnp.int32),
-            jnp.full(points.shape[:-1], -1, dtype=jnp.int32),
-        )
+        p = np.asarray(points)
+        if p.shape[-1] != shape.dim:
+            raise ValueError(f"expected points with {shape.dim} coordinates")
+        flat = p.reshape(-1, shape.dim)
+        distance, material = components[0].sample(flat)
+        best = np.array(distance, copy=True)
+        materials = np.array(material, copy=True)
+        order = np.zeros(flat.shape[0], dtype=np.int32)
 
-        def evaluate(component, state, mask):
-            best, material, rank = state
-            distance, sampled_material = component.sample(points)
-            index = ranks[id(component)]
-            chosen = mask & ((distance < best) | ((distance == best) & (index > rank)))
-            return (
-                jnp.where(mask, jnp.minimum(best, distance), best),
-                jnp.where(chosen, sampled_material, material),
-                jnp.where(chosen, index, rank),
-            )
+        def evaluate(index, component, selected):
+            if not selected.size:
+                return
+            d, m = component.sample(flat[selected])
+            improve = (d < best[selected]) | ((d == best[selected]) & (index > order[selected]))
+            selected = selected[improve]
+            best[selected] = d[improve]
+            materials[selected] = m[improve]
+            order[selected] = index
 
-        for component in fallback:
-            state = evaluate(component, state, active)
+        all_points = np.arange(flat.shape[0])
+        for index, component in ordinary:
+            evaluate(index, component, all_points)
 
-        def visit(entry, state, mask):
-            node, growth, children = entry
-            # Bounds of f <= t grow by at most t * growth on each axis.
-            # Inside the zero-level box no negative-distance bound is assumed.
-            lo, hi = jnp.asarray(node.bounds.minimum), jnp.asarray(node.bounds.maximum)
-            magnitude = jnp.maximum(
-                jnp.max(jnp.abs(points), axis=-1),
-                jnp.maximum(jnp.max(jnp.abs(lo)), jnp.max(jnp.abs(hi))),
-            )
-            margin = 32 * jnp.finfo(points.dtype).eps * (1 + magnitude)
-            gap = jnp.maximum(lo - points, points - hi) - margin[..., None]
-            lower = jnp.max(gap / jnp.asarray(growth), axis=-1)
-            lower = jnp.where(lower > 0, lower, -jnp.inf)
-            needed = mask & ((lower <= state[0]) | jnp.isnan(state[0]))
+        def visit(node, selected):
+            if not selected.size:
+                return
+            lo = np.asarray(node.bounds.minimum)
+            hi = np.asarray(node.bounds.maximum)
+            q = flat[selected]
+            outside = np.any((q < lo) | (q > hi), axis=-1)
+            gap = np.maximum(np.maximum(lo - q, q - hi), 0)
+            bound = np.linalg.norm(gap, axis=-1)
+            selected = selected[~outside | (bound <= best[selected])]
+            if not selected.size:
+                return
+            if node.children:
+                for child in node.children:
+                    visit(child, selected)
+            else:
+                for component in node.shapes:
+                    evaluate(indexed[id(component)], component, selected)
 
-            def descend(current):
-                if node.is_leaf:
-                    return evaluate(node.shapes[0], current, needed)
-                for child in children:
-                    current = visit(child, current, needed)
-                return current
-
-            # A scalar cond really skips field execution for a whole tile.
-            return jax.lax.cond(jnp.any(needed), descend, lambda current: current, state)
-
-        distance, material, _ = visit(tree, state, active)
-        return distance, material
+        visit(tree, all_points)
+        return best.reshape(p.shape[:-1]), materials.reshape(p.shape[:-1])
 
     return sample

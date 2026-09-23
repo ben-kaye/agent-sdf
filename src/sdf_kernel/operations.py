@@ -1,6 +1,6 @@
 """Section lofts and spatially varying extrusion fields."""
 
-import jax.numpy as jnp
+import numpy as np
 
 from .dsl import Shape, _number, _point, _positive
 
@@ -60,8 +60,8 @@ def extrude(profile, height, *, offset=0.0, bounds=None):
 
 
 def _capped(planar, axial):
-    return jnp.hypot(jnp.maximum(planar, 0), jnp.maximum(axial, 0)) + jnp.minimum(
-        jnp.maximum(planar, axial), 0
+    return np.hypot(np.maximum(planar, 0), np.maximum(axial, 0)) + np.minimum(
+        np.maximum(planar, axial), 0
     )
 
 
@@ -69,37 +69,37 @@ def evaluate_operation(node, q, evaluate):
     if node.kind == "variable_extrude":
         height, offset, _ = node.data
         x, y, z = q[..., 0], q[..., 1], q[..., 2]
-        height = jnp.asarray(height(x, y) if callable(height) else height)
-        offset = jnp.asarray(offset(x, y) if callable(offset) else offset)
+        height = np.asarray(height(x, y) if callable(height) else height)
+        offset = np.asarray(offset(x, y) if callable(offset) else offset)
         distance, material = evaluate(node.children[0], q[..., :2])
-        distance = _capped(distance, jnp.abs(z - offset) - height / 2)
+        distance = _capped(distance, np.abs(z - offset) - height / 2)
     else:
         stations, (axis, transverse) = node.data
         z = q[..., axis]
-        xy = q[..., jnp.asarray(transverse)]
+        xy = q[..., np.asarray(transverse)]
         if node.kind == "section_loft":
-            table = jnp.asarray(stations)
+            table = np.asarray(stations)
             positions = table[:, 0]
-            ox, oy, sx, sy = (jnp.interp(z, positions, table[:, i]) for i in range(1, 5))
-            scale = jnp.stack((sx, sy), axis=-1)
-            offset = jnp.stack((ox, oy), axis=-1)
+            ox, oy, sx, sy = (np.interp(z, positions, table[:, i]) for i in range(1, 5))
+            scale = np.stack((sx, sy), axis=-1)
+            offset = np.stack((ox, oy), axis=-1)
             distance, material = evaluate(node.children[0], (xy - offset) / scale)
-            distance *= jnp.minimum(sx, sy)
+            distance *= np.minimum(sx, sy)
         else:
-            positions = jnp.asarray(stations)
-            index = jnp.clip(jnp.searchsorted(positions, z, side="right") - 1, 0, len(stations) - 2)
-            weight = jnp.clip(
+            positions = np.asarray(stations)
+            index = np.clip(np.searchsorted(positions, z, side="right") - 1, 0, len(stations) - 2)
+            weight = np.clip(
                 (z - positions[index]) / (positions[index + 1] - positions[index]), 0, 1
             )
             samples = [evaluate(child, xy) for child in node.children]
-            fields = jnp.stack([sample[0] for sample in samples], axis=-1)
-            materials = jnp.stack([sample[1] for sample in samples], axis=-1)
-            a = jnp.take_along_axis(fields, index[..., None], axis=-1)[..., 0]
-            b = jnp.take_along_axis(fields, (index + 1)[..., None], axis=-1)[..., 0]
+            fields = np.stack([sample[0] for sample in samples], axis=-1)
+            materials = np.stack([sample[1] for sample in samples], axis=-1)
+            a = np.take_along_axis(fields, index[..., None], axis=-1)[..., 0]
+            b = np.take_along_axis(fields, (index + 1)[..., None], axis=-1)[..., 0]
             distance = (1 - weight) * a + weight * b
             nearest = index + (weight >= 0.5)
-            material = jnp.take_along_axis(materials, nearest[..., None], axis=-1)[..., 0]
-        distance = _capped(distance, jnp.maximum(positions[0] - z, z - positions[-1]))
+            material = np.take_along_axis(materials, nearest[..., None], axis=-1)[..., 0]
+        distance = _capped(distance, np.maximum(positions[0] - z, z - positions[-1]))
     return distance, material
 
 
