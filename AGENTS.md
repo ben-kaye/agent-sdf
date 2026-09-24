@@ -32,4 +32,6 @@ When a user asks you to create geometry, follow these rules:
 - Do not inspect `src/`.
 - Read `README.md` and use the public API. Compose its operations into high-level procedures as needed.
 - Use `custom_sdf` when the public operations cannot express the shape clearly.
-- Render and inspect the result. If the documented API is unclear or insufficient, report the specific gap.
+- Render often to inspect your geometry. 
+- If the documented API is unclear or insufficient, report the specific gap.
+- Avoid encoding text in the geometry.
