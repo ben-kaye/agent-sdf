@@ -131,7 +131,7 @@ def main():
         for name, camera in cameras.items():
             print(f"Rendering {name} ({len(frames) + 1}/{len(cameras)})", flush=True)
             frame = render(
-                loaded.scene,
+                loaded.compiled,
                 width,
                 height,
                 materials=loaded.materials,

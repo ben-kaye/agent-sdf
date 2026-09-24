@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-from math import cos, hypot, isfinite, pi, sin
+from math import hypot, isfinite, pi
 
 import numpy as np
 
-from .dsl import Shape
-from .model import Model
+from .model import compile_scene
 
 _MAX_NODES = 4096
 _MAX_SWEEP_SPANS = 128
@@ -25,14 +24,6 @@ def _f(value):
 def _v(values):
     values = tuple(values)
     return f"vec{len(values)}(" + ", ".join(map(_f, values)) + ")"
-
-
-def _mat_inverse(matrix):
-    try:
-        result = np.linalg.inv(np.asarray(matrix, dtype=float))
-    except np.linalg.LinAlgError as exc:
-        raise ValueError("GLSL affine transform must be invertible") from exc
-    return tuple(tuple(float(x) for x in row) for row in result)
 
 
 def _affine_point(matrix, translation, p):
@@ -82,7 +73,7 @@ def _field_magnitude(node, box, bound):
     radius = hypot(*(b - a for a, b in zip(center, box.maximum, strict=True)))
     value = float(node.sample(np.asarray(center, dtype=float))[0])
     if not isfinite(value):
-        raise ValueError("GLSL loft profile has a nonfinite field value")
+        raise ValueError("GLSL profile has a nonfinite field value")
     return abs(value) + bound * radius + 1e-5
 
 
@@ -92,12 +83,7 @@ def _lipschitz(node, box):
 
     kind = node.kind
     data = node.data
-    if kind == "translate":
-        child_box = AABB(
-            tuple(a - d for a, d in zip(box.minimum, data.offset, strict=True)),
-            tuple(b - d for b, d in zip(box.maximum, data.offset, strict=True)),
-        )
-    elif kind == "linear_pattern":
+    if kind == "linear_pattern":
         displacement = tuple((data.count - 1) * value for value in data.step)
         child_box = AABB(
             tuple(a - max(0.0, d) for a, d in zip(box.minimum, displacement, strict=True)),
@@ -113,31 +99,20 @@ def _lipschitz(node, box):
         low[a] = low[b] = -radius
         high[a] = high[b] = radius
         child_box = AABB(low, high)
-    elif kind == "scale":
-        child_box = AABB(
-            tuple(a / data.factor for a in box.minimum),
-            tuple(b / data.factor for b in box.maximum),
-        )
-    elif kind == "rotate":
-        angle, axis = data
-        c, s = cos(angle), sin(angle)
-        if node.dim == 2:
-            matrix = ((c, s), (-s, c))
-        elif axis == "x":
-            matrix = ((1, 0, 0), (0, c, s), (0, -s, c))
-        elif axis == "y":
-            matrix = ((c, 0, -s), (0, 1, 0), (s, 0, c))
-        else:
-            matrix = ((c, s, 0), (-s, c, 0), (0, 0, 1))
-        child_box = _box_map(box, matrix, (0,) * node.dim)
     elif kind == "transform":
         transform = data.transform
-        if transform.forward_affine is None:
-            raise ValueError("GLSL affine transform must have forward_affine")
-        matrix, translation = transform.forward_affine
-        inverse = np.asarray(_mat_inverse(matrix))
-        offset = -inverse @ np.asarray(translation)
+        inverse = np.asarray(transform.inverse_matrix)
+        offset = -inverse @ np.asarray(transform.offset)
         child_box = _box_map(box, inverse, offset)
+    elif kind == "slice":
+        plane = data.plane
+        matrix = tuple(zip(plane.x_direction, plane.y_direction, strict=True))
+        child_box = _box_map(box, matrix, plane.origin)
+    elif kind == "warp":
+        center = np.asarray(box.minimum) / 2 + np.asarray(box.maximum) / 2
+        radius = np.linalg.norm(np.asarray(box.maximum) - center) * data.warp.lipschitz
+        mapped = data.warp.map_points(center)
+        child_box = AABB(tuple(mapped - radius), tuple(mapped + radius))
     elif kind in ("extrude", "variable_extrude", "profile_sweep"):
         if kind == "profile_sweep":
             # A sweep samples profiles at offsets from span origins.
@@ -157,7 +132,7 @@ def _lipschitz(node, box):
             for y in (box.minimum[1], box.maximum[1])
         )
         child_box = AABB((0, box.minimum[2]), (radius, box.maximum[2]))
-    elif kind in ("loft", "section_loft"):
+    elif kind in ("field_morph", "loft"):
         stations, (axis, transverse) = data
         child_box = AABB(
             tuple(box.minimum[i] for i in transverse),
@@ -165,7 +140,7 @@ def _lipschitz(node, box):
         )
     else:
         child_box = box
-    if kind == "section_loft":
+    if kind == "loft":
         stations = data.stations
         axial = data.axes[0]
         active = [
@@ -204,7 +179,7 @@ def _lipschitz(node, box):
             )
         result = hypot(transverse_bound, axial_bound, 1.0)
         children = ()
-    elif kind == "loft":
+    elif kind == "field_morph":
         profiles = node.children
         bounds = [_lipschitz(profile, child_box) for profile in profiles]
         magnitudes = [
@@ -214,7 +189,7 @@ def _lipschitz(node, box):
         axial = max(
             (a + b) / (z1 - z0)
             for a, b, z0, z1 in zip(
-                magnitudes, magnitudes[1:], data.stations, data.stations[1:], strict=True
+                magnitudes[:-1], magnitudes[1:], data.stations[:-1], data.stations[1:], strict=True
             )
         )
         result = hypot(max(bounds), axial, 1.0)
@@ -241,26 +216,20 @@ def _lipschitz(node, box):
     elif kind in ("min", "max", "subtract", "smooth_union"):
         # The smooth minimum's gradient is a convex combination of its inputs.
         result = max(children)
-    elif (
-        kind
-        in (
-            "translate",
-            "rotate",
-            "linear_pattern",
-            "radial_pattern",
-            "offset",
-            "shell",
-            "material",
-            "feature",
-        )
-        or kind == "scale"
+    elif kind in (
+        "linear_pattern",
+        "radial_pattern",
+        "offset",
+        "shell",
+        "material",
+        "feature",
+        "slice",
+        "warp",
     ):
         result = children[0]
     elif kind == "transform":
         transform = node.data.transform
-        if transform.forward_affine is None:
-            raise ValueError("GLSL affine transform must have forward_affine")
-        inverse = np.asarray(_mat_inverse(transform.forward_affine[0]))
+        inverse = np.asarray(transform.inverse_matrix)
         result = children[0] * transform.distance_scale * float(np.linalg.norm(inverse, 2))
     elif kind == "extrude":
         result = max(children[0], 1.0)
@@ -290,7 +259,7 @@ def _lipschitz(node, box):
                 "for callable fields"
             )
         result = hypot(children[0], hypot(1.0, offset + height * 0.5))
-    elif kind in ("loft", "section_loft"):
+    elif kind in ("field_morph", "loft"):
         pass
     else:
         raise ValueError(f"GLSL lowering does not support shape kind '{kind}'")
@@ -310,7 +279,7 @@ def _section_span_box(node, first, last):
 
     profile = node.children[0].bounds()
     if profile.is_empty or not all(isfinite(x) for x in profile.minimum + profile.maximum):
-        raise ValueError("GLSL section loft needs finite profile bounds for safe stepping")
+        raise ValueError("GLSL loft needs finite profile bounds for safe stepping")
     axis, transverse = node.data.axes
     low, high = [0.0] * 3, [0.0] * 3
     low[axis], high[axis] = first[0], last[0]
@@ -350,8 +319,6 @@ class _StepLowerer:
             body = f"return max({children[0]}(p, ray), {children[1]}(p, ray));"
         elif kind == "subtract":
             body = f"return max({children[0]}(p, ray), -{children[1]}(p, ray));"
-        elif kind == "translate":
-            body = f"return {child}(p - {_v(node.data.offset)}, ray);"
         elif kind == "linear_pattern":
             body = (
                 f"float best = 1e30; for (int i = 0; i < {node.data.count}; ++i) {{ "
@@ -369,26 +336,10 @@ class _StepLowerer:
                 f"best = min(best, {child}({local}, {local_ray})); "
                 "} return best;"
             )
-        elif kind == "scale":
-            factor = _f(node.data.factor)
-            body = f"return {factor} * {child}(p / {factor}, ray);"
-        elif kind == "rotate":
-            angle, axis = node.data
-            c, s = _f(cos(angle)), _f(sin(angle))
-            if dim == 2:
-                mapped = f"vec2(({c})*p.x+({s})*p.y,-({s})*p.x+({c})*p.y)"
-            elif axis == "x":
-                mapped = f"vec3(p.x,({c})*p.y+({s})*p.z,-({s})*p.y+({c})*p.z)"
-            elif axis == "y":
-                mapped = f"vec3(({c})*p.x-({s})*p.z,p.y,({s})*p.x+({c})*p.z)"
-            else:
-                mapped = f"vec3(({c})*p.x+({s})*p.y,-({s})*p.x+({c})*p.y,p.z)"
-            rotated_ray = mapped.replace("p.", "ray.")
-            body = f"return {child}({mapped}, {rotated_ray});"
         elif kind == "transform":
             transform = node.data.transform
-            inverse = _mat_inverse(transform.forward_affine[0])
-            mapped = _affine_point(inverse, transform.forward_affine[1], "p")
+            inverse = transform.inverse_matrix
+            mapped = _affine_point(inverse, transform.offset, "p")
             ray_terms = (
                 "("
                 + " + ".join(
@@ -404,7 +355,7 @@ class _StepLowerer:
                 f"float speed = length(localRay); "
                 f"return {child}({mapped}, localRay / speed) / speed;"
             )
-        elif kind == "section_loft":
+        elif kind == "loft":
             body = self._section_step(node, raw)
         else:
             body = self._raw_step(node, raw)
@@ -464,7 +415,7 @@ class _StepLowerer:
                 )
             )
             box = box.expanded(pad)
-        elif node.kind in ("loft", "section_loft", "variable_extrude"):
+        elif node.kind in ("field_morph", "loft", "variable_extrude"):
             raise ValueError(f"GLSL {node.kind} needs finite bounds for conservative stepping")
         else:
             box = AABB((0.0,) * node.dim, (0.0,) * node.dim)
@@ -622,8 +573,7 @@ def _quadratic_coefficients(segment):
 
 def feature_names(scene):
     """Return the feature ID table used by generated GLSL (index zero is unnamed)."""
-    if isinstance(scene, Model):
-        scene = scene.scene()
+    scene = compile_scene(scene).shape
     names = [None]
     seen = set()
 
@@ -723,8 +673,6 @@ class _Lowerer:
                 f"float h = max({radius} - abs(a.x - b.x), 0.0) / {radius};",
                 f"return vec3(min(a.x, b.x) - h * h * {radius} * 0.25, a.x < b.x ? a.yz : b.yz);",
             ]
-        if kind == "translate":
-            return [f"return {child}(p - {_v(data.offset)});"]
         if kind == "linear_pattern":
             return [
                 "vec3 best = vec3(1e30, 0.0, 0.0);",
@@ -746,30 +694,32 @@ class _Lowerer:
                 "}",
                 "return best;",
             ]
-        if kind == "scale":
-            factor = _f(data.factor)
-            return [f"vec3 h = {child}(p / {factor});", f"return vec3(h.x * {factor}, h.yz);"]
-        if kind == "rotate":
-            angle, axis = data.angle, data.axis
-            c, s = _f(cos(angle)), _f(sin(angle))
-            if node.dim == 2:
-                mapped = f"vec2(({c}) * p.x + ({s}) * p.y, -({s}) * p.x + ({c}) * p.y)"
-            elif axis == "x":
-                mapped = f"vec3(p.x, ({c}) * p.y + ({s}) * p.z, -({s}) * p.y + ({c}) * p.z)"
-            elif axis == "y":
-                mapped = f"vec3(({c}) * p.x - ({s}) * p.z, p.y, ({s}) * p.x + ({c}) * p.z)"
-            else:
-                mapped = f"vec3(({c}) * p.x + ({s}) * p.y, -({s}) * p.x + ({c}) * p.y, p.z)"
-            return [f"return {child}({mapped});"]
         if kind == "transform":
             transform = data.transform
-            if transform.forward_affine is None:
-                raise ValueError("GLSL lowering requires forward_affine for custom transforms")
-            matrix, translation = transform.forward_affine
-            mapped = _affine_point(_mat_inverse(matrix), translation, "p")
+            mapped = _affine_point(transform.inverse_matrix, transform.offset, "p")
             return [
                 f"vec3 h = {child}({mapped});",
                 f"return vec3(h.x * {_f(transform.distance_scale)}, h.yz);",
+            ]
+        if kind == "slice":
+            plane = data.plane
+            mapped = f"{_v(plane.origin)} + p.x * {_v(plane.x_direction)} + p.y * {_v(plane.y_direction)}"
+            return [f"return {child}({mapped});"]
+        if kind == "warp":
+            from .field import coordinates, to_glsl
+
+            try:
+                mapped = tuple(data.warp.inverse(coordinates()[: node.dim]))
+                if len(mapped) != node.dim:
+                    raise ValueError("wrong coordinate count")
+                expressions = tuple(to_glsl(value) for value in mapped)
+            except Exception as exc:
+                raise ValueError("GLSL warp inverse must return symbolic coordinates") from exc
+            mapped = f"vec{node.dim}(" + ", ".join(expressions) + ")"
+            return [
+                *(f"float {axis} = p.{axis};" for axis in "xyz"[: node.dim]),
+                f"vec3 h = {child}({mapped});",
+                f"return vec3(h.x * {_f(data.warp.distance_scale)}, h.yz);",
             ]
         if kind == "offset":
             return [f"vec3 h = {child}(p);", f"return vec3(h.x - {_f(data.amount)}, h.yz);"]
@@ -812,27 +762,20 @@ class _Lowerer:
             ]
         if kind == "revolve":
             return [f"return {child}(vec2(length(p.xy), p.z));"]
-        if kind in ("loft", "section_loft"):
-            return self._loft(node, children)
+        if kind in ("field_morph", "loft"):
+            return self._sections(node, children)
         if kind == "profile_sweep":
             return self._sweep(node, child)
         if kind == "custom":
             from .field import compile_glsl as compile_field_glsl
-            from .field import coordinates, to_glsl
-            from .hit import Hit
+            from .field import to_glsl
 
-            fn, material = data.fn, data.material_id
-            value = fn(*coordinates()[: node.dim])
-            if isinstance(value, Hit):
-                distance, material = value.distance, value.material
-            else:
-                distance = value
             coordinate_lines = [f"float {axis} = p.{axis};" for axis in "xyz"[: node.dim]]
-            declarations, result = compile_field_glsl(distance)
+            declarations, result = compile_field_glsl(data.distance)
             return [
                 *coordinate_lines,
                 *declarations,
-                f"return vec3({result}, {to_glsl(material)}, 0.0);",
+                f"return vec3({result}, {to_glsl(data.material)}, 0.0);",
             ]
         raise ValueError(f"GLSL lowering does not support shape kind '{kind}'")
 
@@ -899,12 +842,12 @@ class _Lowerer:
             "return vec3(inside ? -d : d, 0.0, 0.0);",
         ]
 
-    def _loft(self, node, children):
+    def _sections(self, node, children):
         stations, (axis, transverse) = node.data.stations, node.data.axes
         ax = "xyz"[axis]
         u, v = ("xyz"[i] for i in transverse)
         lines = [f"float z = p.{ax};", f"vec2 uv = p.{u}{v};"]
-        if node.kind == "section_loft":
+        if node.kind == "loft":
             lines += ["vec4 section = vec4(0.0);", "float t;"]
             for i, (a, b) in enumerate(zip(stations, stations[1:], strict=False)):
                 condition = "if" if i == 0 else "else if"
@@ -970,20 +913,22 @@ class _Lowerer:
 
 
 def compile_glsl(scene, *, bvh=False):
-    """Return GLSL ES 3.00 defining vec3 mapScene(vec3 p).
+    """Return GLSL ES 3.00 for the union field and visible part surfaces.
 
     Set bvh to prune certified union components on the GPU.
     """
-    if isinstance(scene, Model):
-        scene = scene.scene()
-    if not isinstance(scene, Shape) or scene.dim != 3:
-        raise ValueError("GLSL scene must be a 3D Shape or Model")
+    compiled = compile_scene(scene)
+    scene = compiled.shape
+    if scene.dim != 3:
+        raise ValueError("GLSL scene must be 3D")
     from .bounds import AABB
 
     box = scene.bounds()
     if box.is_empty or not all(isfinite(x) for x in box.minimum + box.maximum):
-        if any(kind in {"loft", "section_loft"} for kind in _shape_kinds(scene)):
-            raise ValueError("GLSL loft scenes need finite scene bounds for safe ray marching")
+        if any(kind in {"field_morph", "loft"} for kind in _shape_kinds(scene)):
+            raise ValueError(
+                "GLSL loft and field_morph scenes need finite bounds for safe ray marching"
+            )
         box = AABB((0.0,) * 3, (0.0,) * 3)
     else:
         padding = max(
@@ -992,19 +937,48 @@ def compile_glsl(scene, *, bvh=False):
         box = box.expanded(padding)
     # BVH gap pruning compares raw fields with Euclidean distances. Disable
     # it for fields whose local certificate may exceed one or is box-limited.
-    box_limited = {"custom", "python", "loft", "section_loft", "variable_extrude"}
+    box_limited = {"custom", "python", "field_morph", "loft", "variable_extrude"}
     bvh = bvh and not any(kind in box_limited for kind in _shape_kinds(scene))
     if bvh:
         bvh = _lipschitz(scene, box) <= 1.0
-    names = feature_names(scene)
+    names = feature_names(compiled)
     compiler = _Lowerer({name: index for index, name in enumerate(names) if name is not None})
     root = compiler.lower(scene)
     stepper = _StepLowerer(compiler.names)
     step_root = stepper.lower(scene)
+    part_roots = tuple(compiler.lower(part.shape) for part in compiled.parts)
+    part_steps = tuple(stepper.lower(part.shape) for part in compiled.parts)
     step_source = [
         *stepper.functions,
         f"float mapStep(vec3 p, vec3 ray) {{ return {step_root}(p, ray); }}",
     ]
+    if len(part_roots) == 1:
+        surface_source = [
+            f"vec3 mapSurface(vec3 p) {{ return {part_roots[0]}(p); }}",
+            f"float mapSurfaceStep(vec3 p, vec3 ray) {{ return abs({part_steps[0]}(p, ray)); }}",
+        ]
+    else:
+        surface_lines = [
+            f"vec3 best = {part_roots[0]}(p);",
+            "float distance = abs(best.x);",
+            "vec3 h;",
+        ]
+        surface_lines.extend(
+            f"h = {name}(p); if (abs(h.x) <= distance) {{ best = h; distance = abs(h.x); }}"
+            for name in part_roots[1:]
+        )
+        surface_lines.append("return best;")
+        step_lines = [f"float best = abs({part_steps[0]}(p, ray));"]
+        step_lines.extend(f"best = min(best, abs({name}(p, ray)));" for name in part_steps[1:])
+        step_lines.append("return best;")
+        surface_source = [
+            "vec3 mapSurface(vec3 p) {\n"
+            + "\n".join(f"  {line}" for line in surface_lines)
+            + "\n}",
+            "float mapSurfaceStep(vec3 p, vec3 ray) {\n"
+            + "\n".join(f"  {line}" for line in step_lines)
+            + "\n}",
+        ]
     if not bvh:
         return "\n".join(
             [
@@ -1012,6 +986,7 @@ def compile_glsl(scene, *, bvh=False):
                 *compiler.functions,
                 *step_source,
                 f"vec3 mapScene(vec3 p) {{ return {root}(p); }}",
+                *surface_source,
             ]
         )
 
@@ -1029,6 +1004,7 @@ def compile_glsl(scene, *, bvh=False):
                 *compiler.functions,
                 *step_source,
                 f"vec3 mapScene(vec3 p) {{ return {root}(p); }}",
+                *surface_source,
             ]
         )
 
@@ -1109,5 +1085,6 @@ def compile_glsl(scene, *, bvh=False):
             *step_source,
             *bvh_functions,
             "vec3 mapScene(vec3 p) {\n" + "\n".join(f"  {line}" for line in map_lines) + "\n}",
+            *surface_source,
         ]
     )

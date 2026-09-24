@@ -7,8 +7,9 @@ from math import cos, isfinite, radians, sin, sqrt, tan
 
 import numpy as np
 
+from .camera import _orientation, _orientation_up
 from .dsl import Shape
-from .model import Model
+from .model import compile_scene
 
 
 @dataclass(frozen=True)
@@ -19,7 +20,7 @@ class SurfaceHit:
     material_id: int
     material_name: str | None
     feature_name: str | None
-    operation_name: str | None
+    instance_path: tuple[str, ...] = ()
     contributors: tuple[str, ...] = ()
 
 
@@ -57,7 +58,8 @@ def _contributors(shape, point):
     kind, data = shape.kind, shape.data
     children = shape.children
     if kind == "feature":
-        return (data.name,)
+        inner = _contributors(children[0], point)
+        return tuple(f"{data.name}/{name}" for name in inner) if inner else (data.name,)
     if kind in ("min", "max", "subtract", "smooth_union"):
         a, b = children
         da, db = _distance(a, point), _distance(b, point)
@@ -97,24 +99,27 @@ def _contributors(shape, point):
     if not children:
         return ()
     child = children[0]
-    if kind == "translate":
-        point = point - np.asarray(data.offset)
-    elif kind == "scale":
-        point = point / data.factor
-    elif kind == "rotate":
-        point = _rotate_back(point, data.angle, data.axis, shape.dim)
-    elif kind == "transform":
+    if kind == "transform":
         point = data.transform.map_points(point)
+    elif kind == "slice":
+        plane = data.plane
+        point = (
+            np.asarray(plane.origin)
+            + point[0] * np.asarray(plane.x_direction)
+            + point[1] * np.asarray(plane.y_direction)
+        )
+    elif kind == "warp":
+        point = data.warp.map_points(point)
     elif kind in ("extrude", "variable_extrude"):
         point = point[:2]
     elif kind == "revolve":
         point = np.array((np.linalg.norm(point[:2]), point[2]))
-    elif kind == "section_loft":
+    elif kind == "loft":
         stations, (axis, transverse) = data.stations, data.axes
         table = np.asarray(stations)
         section = np.array([np.interp(point[axis], table[:, 0], table[:, i]) for i in range(1, 5)])
         point = (point[list(transverse)] - section[:2]) / section[2:]
-    elif kind == "loft":
+    elif kind == "field_morph":
         stations, (axis, transverse) = data.stations, data.axes
         index = int(
             np.clip(np.searchsorted(stations, point[axis], side="right") - 1, 0, len(stations) - 2)
@@ -128,31 +133,6 @@ def _contributors(shape, point):
         # its profile name is shared across every swept span.
         return _contributors(child, np.zeros(2))
     return _contributors(child, point)
-
-
-def _operation_at(model, point):
-    history = {step["name"]: step for step in model.history()}
-    current = model._current
-    while current is not None:
-        step = history[current]
-        operation = step["op"]
-        if operation in ("define", "transform", "place"):
-            return None
-        base, tool = step["depends_on"]
-        da = _distance(model._shapes[base], point)
-        db = _distance(model._shapes[tool], point)
-        if operation == "min":
-            tool_wins = not da < db
-        elif operation == "max":
-            tool_wins = not da > db
-        elif operation == "subtract":
-            tool_wins = not da > -db
-        else:
-            tool_wins = db <= da or abs(da - db) < step["radius"]
-        if tool_wins:
-            return current
-        current = base
-    return None
 
 
 def _clip_ray(shape, origin, direction, max_distance, tolerance):
@@ -178,20 +158,8 @@ def _clip_ray(shape, origin, direction, max_distance, tolerance):
     return near, far
 
 
-def ray_cast(shape_or_model, origin, direction, *, max_distance=100.0, tolerance=1e-4):
-    """Return the first surface crossing along a world-space ray, or None."""
-    model = shape_or_model if isinstance(shape_or_model, Model) else None
-    shape = model.scene() if model is not None else shape_or_model
-    if not isinstance(shape, Shape) or shape.dim != 3:
-        raise ValueError("ray_cast needs a 3D Shape or Model")
-    origin, direction = _vector(origin, "origin"), _vector(direction, "direction")
-    length = np.linalg.norm(direction)
-    if length == 0:
-        raise ValueError("ray direction must be nonzero")
-    direction /= length
-    max_distance, tolerance = float(max_distance), float(tolerance)
-    if not isfinite(max_distance) or max_distance <= 0 or not isfinite(tolerance) or tolerance <= 0:
-        raise ValueError("max_distance and tolerance must be finite and positive")
+def _cast_shape(shape, origin, direction, max_distance, tolerance):
+    """Cast one independent solid so another solid cannot hide its surface."""
     near, far = _clip_ray(shape, origin, direction, max_distance, tolerance)
     if near > far:
         return None
@@ -236,28 +204,69 @@ def ray_cast(shape_or_model, origin, direction, *, max_distance=100.0, tolerance
     )
     normal_length = np.linalg.norm(gradient)
     normal = gradient / normal_length if normal_length > 1e-12 else -direction
-    _, material_id = _sample(shape, point)
-    names = _contributors(shape, point)
-    material_name = None
-    if model is not None:
-        material_name = next(
-            (name for name, value in model.materials().items() if value["id"] == material_id),
-            None,
-        )
-    return SurfaceHit(
+    return (
         tuple(float(v) for v in point),
         tuple(float(v) for v in normal),
         float(hit_t),
-        material_id,
-        material_name,
-        names[0] if names else None,
-        _operation_at(model, point) if model is not None else None,
-        names,
+        _sample(shape, point)[1],
+        _contributors(shape, point),
     )
 
 
+def _local_feature(name, path):
+    if not path:
+        return name
+    prefix = "/".join(path)
+    if name == prefix:
+        return None
+    if name.startswith(prefix + "/"):
+        return name[len(prefix) + 1 :]
+    return name
+
+
+def ray_cast(shape_or_scene, origin, direction, *, max_distance=100.0, tolerance=1e-4):
+    """Return the first surface crossing and its instance identity."""
+    compiled = compile_scene(shape_or_scene)
+    if not isinstance(compiled.shape, Shape) or compiled.shape.dim != 3:
+        raise ValueError("ray_cast needs a 3D Shape, Part, Assembly, or Scene")
+    origin, direction = _vector(origin, "origin"), _vector(direction, "direction")
+    length = np.linalg.norm(direction)
+    if length == 0:
+        raise ValueError("ray direction must be nonzero")
+    direction /= length
+    max_distance, tolerance = float(max_distance), float(tolerance)
+    if not isfinite(max_distance) or max_distance <= 0 or not isfinite(tolerance) or tolerance <= 0:
+        raise ValueError("max_distance and tolerance must be finite and positive")
+    material_names = {value["id"]: name for name, value in compiled.materials.items()}
+    nearest = None
+    for part in compiled.parts:
+        hit = _cast_shape(part.shape, origin, direction, max_distance, tolerance)
+        if hit is None:
+            continue
+        point, normal, distance, material_id, names = hit
+        if nearest is not None and distance > nearest.distance:
+            continue
+        local_names = tuple(
+            name for value in names if (name := _local_feature(value, part.path)) is not None
+        )
+        material_name = material_names.get(material_id)
+        if material_name is not None and part.part is not None:
+            material_name = material_name.rsplit("/", 1)[-1]
+        nearest = SurfaceHit(
+            point,
+            normal,
+            distance,
+            material_id,
+            material_name,
+            local_names[0] if local_names else None,
+            part.path,
+            tuple(dict.fromkeys(local_names)),
+        )
+    return nearest
+
+
 def pick(
-    shape_or_model,
+    shape_or_scene,
     x,
     y,
     width,
@@ -265,14 +274,21 @@ def pick(
     *,
     eye,
     target,
-    up=(0, 0, 1),
+    up=None,
     fov=40.0,
     camera_size=2.0,
     max_distance=100.0,
     tolerance=1e-4,
+    orientation=None,
 ):
-    """Pick a pixel, with (0, 0) at the image's top left."""
-    eye, target, up = _vector(eye, "eye"), _vector(target, "target"), _vector(up, "up")
+    """Pick a top-left-origin pixel; orientation controls camera roll around the view direction."""
+    eye, target = _vector(eye, "eye"), _vector(target, "target")
+    if up is not None:
+        up = _vector(up, "up")
+    if orientation is not None:
+        orientation_up = np.asarray(_orientation_up(_orientation(orientation)))
+        if up is not None and np.dot(up, orientation_up) <= 0:
+            raise ValueError("up and orientation must point to the same camera hemisphere")
     if (
         isinstance(width, bool)
         or isinstance(height, bool)
@@ -295,10 +311,24 @@ def pick(
     if forward_length == 0:
         raise ValueError("eye and target must differ")
     forward /= forward_length
-    right = np.cross(forward, up)
+    if up is not None and np.linalg.norm(np.cross(forward, up)) < 1e-12:
+        raise ValueError("up must not be parallel to the view direction")
+    if orientation is not None:
+        camera_up_hint = orientation_up
+    elif up is not None:
+        camera_up_hint = up
+    else:
+        back = -forward
+        horizontal = np.linalg.norm(back[:2])
+        if horizontal > 1e-8:
+            right = np.array((-back[1] / horizontal, back[0] / horizontal, 0.0))
+        else:
+            right = np.array((1.0, 0.0, 0.0))
+        camera_up_hint = np.cross(right, forward)
+    right = np.cross(forward, camera_up_hint)
     right_length = np.linalg.norm(right)
     if right_length < 1e-12:
-        raise ValueError("up must not be parallel to the view direction")
+        raise ValueError("camera up must not be parallel to the view direction")
     right /= right_length
     camera_up = np.cross(right, forward)
     spread = camera_size * 0.5 if fov == 0 else tan(radians(fov) * 0.5)
@@ -308,7 +338,7 @@ def pick(
     origin = eye + offset if fov == 0 else eye
     direction = forward if fov == 0 else forward + offset
     return ray_cast(
-        shape_or_model, origin, direction, max_distance=max_distance, tolerance=tolerance
+        shape_or_scene, origin, direction, max_distance=max_distance, tolerance=tolerance
     )
 
 

@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from math import inf, isfinite
 from typing import TYPE_CHECKING
 
+import numpy as np
+
 from .bounds import AABB
 
 if TYPE_CHECKING:
@@ -24,10 +26,10 @@ class BVHNode:
 
 
 def _union_components(shape: Shape) -> list[Shape]:
-    """Flatten unions through affine and material wrappers, preserving other CSG."""
+    """Flatten unions through point maps and labels, preserving other CSG."""
     from .dsl import Shape
 
-    distributive = {"translate", "rotate", "scale", "transform", "material", "feature"}
+    distributive = {"transform", "slice", "warp", "material", "feature"}
     components = []
     pending = [(shape, ())]
     while pending:
@@ -51,16 +53,16 @@ def _certified_box(shape: Shape):
     """
     if shape.kind in {"sphere", "box", "cylinder", "torus", "capsule", "tube"}:
         pass
-    elif shape.kind in {
-        "translate",
-        "rotate",
-        "scale",
-        "linear_pattern",
-        "radial_pattern",
-        "material",
-        "feature",
-    }:
+    elif shape.kind in {"linear_pattern", "radial_pattern", "material", "feature"}:
         if _certified_box(shape.children[0]) is None:
+            return None
+    elif shape.kind == "transform":
+        transform = shape.data.transform
+        matrix = getattr(transform, "matrix", None)
+        if matrix is None or _certified_box(shape.children[0]) is None:
+            return None
+        singular_values = np.linalg.svd(np.asarray(matrix, dtype=float), compute_uv=False)
+        if not np.allclose(singular_values, singular_values[0], rtol=1e-10, atol=0):
             return None
     else:
         return None

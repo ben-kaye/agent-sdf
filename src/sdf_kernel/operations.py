@@ -1,52 +1,52 @@
-"""Section lofts and spatially varying extrusion fields."""
+"""Profile lofts, field morphs, and spatially varying extrusion fields."""
 
 import numpy as np
 
-from .dsl import Shape, _number, _point, _positive
-from .shape_payloads import Extrude, Loft, SectionLoft, VariableExtrude
+from .dsl import LoftStation, Shape, _number, _positive
+from .shape_payloads import Extrude, FieldMorph, Loft, VariableExtrude
 
 
-def _axes(axis):
+def _axes(axis, operation):
     if axis not in ("x", "y", "z"):
-        raise ValueError("loft axis must be x, y, or z")
+        raise ValueError(f"{operation} axis must be x, y, or z")
     axial = "xyz".index(axis)
     return axial, tuple(i for i in range(3) if i != axial)
 
 
-def _positions(values):
+def _positions(values, operation):
     if len(values) < 2 or any(a >= b for a, b in zip(values, values[1:], strict=False)):
-        raise ValueError("loft needs at least two strictly increasing station positions")
+        raise ValueError(f"{operation} needs at least two strictly increasing station positions")
 
 
-def loft(sections, *, axis="z") -> Shape:
+def field_morph(sections, *, axis="z") -> Shape:
     """Interpolate 2D signed fields at (position, profile) sections, with flat caps.
 
     This implicit morph is a distance estimate; use profile.loft for interpolated
     offsets/scales of one profile. Transverse coordinates follow world axis order.
     """
-    axes = _axes(axis)
+    axes = _axes(axis, "field_morph")
     sections = tuple(sections)
     positions, profiles = [], []
     for position, profile in sections:
         if not isinstance(profile, Shape) or profile.dim != 2:
-            raise ValueError("loft sections must be 2D shapes")
+            raise ValueError("field_morph sections must be 2D shapes")
         positions.append(_number(position))
         profiles.append(profile)
-    _positions(positions)
-    return Shape("loft", 3, Loft(tuple(positions), axes), tuple(profiles))
+    _positions(positions, "field_morph")
+    return Shape("field_morph", 3, FieldMorph(tuple(positions), axes), tuple(profiles))
 
 
-def section_loft(profile, stations, *, axis="z") -> Shape:
+def loft(profile, stations, *, axis="z") -> Shape:
     """Linearly interpolate profile offsets and positive axis scales between stations."""
     if not isinstance(profile, Shape) or profile.dim != 2:
         raise ValueError("loft requires a 2D profile")
-    axes = _axes(axis)
-    stations = tuple(_point(station, 5) for station in stations)
-    _positions([station[0] for station in stations])
-    for station in stations:
-        _positive(station[3])
-        _positive(station[4])
-    return Shape("section_loft", 3, SectionLoft(stations, axes), (profile,))
+    axes = _axes(axis, "loft")
+    stations = tuple(stations)
+    if any(not isinstance(station, LoftStation) for station in stations):
+        raise ValueError("loft stations must be LoftStation values")
+    _positions([station.position for station in stations], "loft")
+    stations = tuple((station.position, *station.offset, *station.scale) for station in stations)
+    return Shape("loft", 3, Loft(stations, axes), (profile,))
 
 
 def extrude(
@@ -91,7 +91,7 @@ def evaluate_operation(node, q, evaluate):
         stations, (axis, transverse) = node.data.stations, node.data.axes
         z = q[..., axis]
         xy = q[..., np.asarray(transverse)]
-        if node.kind == "section_loft":
+        if node.kind == "loft":
             table = np.asarray(stations)
             positions = table[:, 0]
             ox, oy, sx, sy = (np.interp(z, positions, table[:, i]) for i in range(1, 5))
@@ -135,7 +135,7 @@ def operation_bounds(node, level, analytic):
             (*planar.maximum, offset + height / 2 + padding),
         )
     stations, (axis, transverse) = node.data.stations, node.data.axes
-    if node.kind == "loft":
+    if node.kind == "field_morph":
         planar = _empty(2)
         for profile in node.children:
             planar = planar.union(analytic(profile, level))

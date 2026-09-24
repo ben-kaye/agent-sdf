@@ -37,7 +37,7 @@ def _compile_scene(source_path, args):
     ):
         bounds = None
     started = perf_counter()
-    shader = compile_glsl(scene, bvh=args.bvh)
+    shader = compile_glsl(loaded.compiled, bvh=args.bvh)
     elapsed = perf_counter() - started
     colors, metal, rough, opacity = material_arrays(materials)
     config = {
@@ -55,12 +55,9 @@ def _compile_scene(source_path, args):
         "roughness": rough.tolist(),
         "opacity": opacity.tolist(),
         "translationMs": round(elapsed * 1000),
-        "featureNames": feature_names(scene),
+        "featureNames": feature_names(loaded.compiled),
     }
-    query_scene = (
-        loaded.model if loaded.model is not None and loaded.model.scene() is scene else scene
-    )
-    return config, shader, query_scene, elapsed
+    return config, shader, loaded.compiled, elapsed
 
 
 def _local_modules(source_dir, excluded):

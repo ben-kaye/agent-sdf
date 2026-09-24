@@ -57,18 +57,14 @@ class Tube(NamedTuple):
 
 
 class Custom(NamedTuple):
-    fn: Any
-    material_id: int
+    distance: Any
+    material: Any
     bounds: Any
-    lipschitz: float | None
+    lipschitz: float
 
 
 class SmoothUnion(NamedTuple):
     radius: float
-
-
-class Translation(NamedTuple):
-    offset: tuple[float, ...]
 
 
 class LinearPattern(NamedTuple):
@@ -81,17 +77,17 @@ class RadialPattern(NamedTuple):
     axis: str
 
 
-class Rotation(NamedTuple):
-    angle: float
-    axis: str
-
-
-class Scale(NamedTuple):
-    factor: float
-
-
 class TransformPayload(NamedTuple):
     transform: Any
+
+
+class WarpPayload(NamedTuple):
+    warp: Any
+    bounds: Any
+
+
+class Slice(NamedTuple):
+    plane: Any
 
 
 class Offset(NamedTuple):
@@ -123,12 +119,12 @@ class VariableExtrude(NamedTuple):
     offset_lipschitz: float | None = None
 
 
-class Loft(NamedTuple):
+class FieldMorph(NamedTuple):
     stations: tuple[float, ...]
     axes: tuple[int, tuple[int, int]]
 
 
-class SectionLoft(NamedTuple):
+class Loft(NamedTuple):
     stations: tuple[tuple[float, float, float, float, float], ...]
     axes: tuple[int, tuple[int, int]]
 
@@ -153,20 +149,19 @@ Payload = (
     | Tube
     | Custom
     | SmoothUnion
-    | Translation
     | LinearPattern
     | RadialPattern
-    | Rotation
-    | Scale
     | TransformPayload
+    | WarpPayload
+    | Slice
     | Offset
     | Shell
     | Material
     | Feature
     | Extrude
     | VariableExtrude
+    | FieldMorph
     | Loft
-    | SectionLoft
     | Sweep
 )
 
@@ -186,20 +181,19 @@ _SPECS = {
     "max": (Empty, None, 2),
     "subtract": (Empty, None, 2),
     "smooth_union": (SmoothUnion, None, 2),
-    "translate": (Translation, None, 1),
     "linear_pattern": (LinearPattern, None, 1),
     "radial_pattern": (RadialPattern, 3, 1),
-    "rotate": (Rotation, None, 1),
-    "scale": (Scale, None, 1),
     "transform": (TransformPayload, None, 1),
+    "warp": (WarpPayload, None, 1),
+    "slice": (Slice, 2, 1),
     "offset": (Offset, None, 1),
     "shell": (Shell, 3, 1),
-    "material": (Material, 3, 1),
+    "material": (Material, None, 1),
     "feature": (Feature, None, 1),
     "extrude": (Extrude, 3, 1),
     "variable_extrude": (VariableExtrude, 3, 1),
-    "loft": (Loft, 3, None),
-    "section_loft": (SectionLoft, 3, 1),
+    "field_morph": (FieldMorph, 3, None),
+    "loft": (Loft, 3, 1),
     "profile_sweep": (Sweep, 3, 1),
     "revolve": (Empty, 3, 1),
 }
@@ -236,12 +230,17 @@ def validate_shape(kind: str, dim: int, data: Payload, children: tuple[Any, ...]
         child.dim != dim for child in children
     ):
         raise ValueError(f"{kind} children must match shape dimension")
-    if kind in ("extrude", "variable_extrude", "revolve", "section_loft", "profile_sweep"):
+    if kind in ("extrude", "variable_extrude", "revolve", "loft", "profile_sweep"):
         if children[0].dim != 2:
             raise ValueError(f"{kind} requires a 2D profile")
-    elif kind == "loft":
+    elif kind == "field_morph":
         if len(children) < 2 or any(child.dim != 2 for child in children):
-            raise ValueError("loft requires at least two 2D profiles")
+            raise ValueError("field_morph requires at least two 2D profiles")
+    elif kind == "slice":
+        from .plane import Plane
+
+        if children[0].dim != 3 or not isinstance(data.plane, Plane):
+            raise ValueError("slice requires a 3D shape and a Plane")
     elif any(child.dim != dim for child in children):
         raise ValueError(f"{kind} children must match shape dimension")
 
@@ -302,21 +301,18 @@ def validate_shape(kind: str, dim: int, data: Payload, children: tuple[Any, ...]
         raise ValueError("curve profile needs valid 2D segments")
     if kind == "custom":
         from .bounds import AABB
-        from .materials import validate_material_id
+        from .field import Scalar
 
-        if not callable(data.fn):
-            raise ValueError("custom SDF needs a callable")
-        validate_material_id(data.material_id)
+        if not isinstance(data.distance, Scalar) or data.distance.kind != "float":
+            raise ValueError("custom distance must be a scalar field")
+        if not isinstance(data.material, Scalar) or data.material.kind != "float":
+            raise ValueError("custom material must be a scalar field")
         if data.bounds is not None and not isinstance(data.bounds, AABB):
             raise ValueError("custom bounds must be an AABB")
-        if data.lipschitz is not None and not _finite(data.lipschitz, positive=True):
+        if not _finite(data.lipschitz, positive=True):
             raise ValueError("custom Lipschitz bound must be positive and finite")
     if kind == "smooth_union" and not _finite(data.radius, positive=True):
         raise ValueError("smooth_union requires a positive finite radius")
-    if kind == "scale" and not _finite(data.factor, positive=True):
-        raise ValueError(f"{kind} requires a positive finite value")
-    if kind == "translate" and not _vector(data.offset, dim):
-        raise ValueError("translation must match shape dimension")
     if kind == "linear_pattern" and not (
         isinstance(data.count, int)
         and not isinstance(data.count, bool)
@@ -332,18 +328,29 @@ def validate_shape(kind: str, dim: int, data: Payload, children: tuple[Any, ...]
         and data.axis in ("x", "y", "z")
     ):
         raise ValueError("radial pattern needs a positive count and valid axis")
-    if kind == "rotate" and not (
-        _finite(data.angle) and data.axis in (("z",) if dim == 2 else ("x", "y", "z"))
-    ):
-        raise ValueError("rotation requires a finite angle and valid axis")
-    if kind == "transform" and getattr(data.transform, "dim", None) != dim:
-        raise ValueError("transform dimension must match shape")
+    if kind == "transform":
+        from .transform import Transform
+
+        if not isinstance(data.transform, Transform) or data.transform.dim != dim:
+            raise ValueError("transform dimension must match shape")
+    if kind == "warp":
+        from .bounds import AABB, as_aabb
+        from .warp import Warp
+
+        if not isinstance(data.warp, Warp) or data.warp.dim != dim:
+            raise ValueError("warp dimension must match shape")
+        if data.bounds is not None:
+            if not isinstance(data.bounds, AABB):
+                raise ValueError("warp bounds must be an AABB")
+            as_aabb(data.bounds, dim)
     if kind == "offset" and not _finite(data.amount):
         raise ValueError("offset requires a finite value")
     if kind == "shell" and not _finite(data.thickness, positive=True):
         raise ValueError("shell requires a positive finite thickness")
-    if kind == "feature" and not (isinstance(data.name, str) and data.name.isidentifier()):
-        raise ValueError("feature name must be a Python identifier")
+    if kind == "feature" and not (
+        isinstance(data.name, str) and all(part.isidentifier() for part in data.name.split("/"))
+    ):
+        raise ValueError("feature name must contain identifier path segments")
     if kind == "material":
         from .materials import validate_material_id
 
@@ -355,9 +362,9 @@ def validate_shape(kind: str, dim: int, data: Payload, children: tuple[Any, ...]
         for field, value in (("height", data.height), ("offset", data.offset))
     ):
         raise ValueError("variable extrusion fields must be callable or finite")
-    if kind == "loft" and len(data.stations) != len(children):
-        raise ValueError("loft stations must match profiles")
-    if kind == "section_loft" and not all(
+    if kind == "field_morph" and len(data.stations) != len(children):
+        raise ValueError("field_morph stations must match profiles")
+    if kind == "loft" and not all(
         isinstance(station, tuple)
         and len(station) == 5
         and all(_finite(value) for value in station)
@@ -365,22 +372,22 @@ def validate_shape(kind: str, dim: int, data: Payload, children: tuple[Any, ...]
         and station[4] > 0
         for station in data.stations
     ):
-        raise ValueError("section loft stations need finite offsets and positive scales")
+        raise ValueError("loft stations need finite offsets and positive scales")
     positions = (
         tuple(station[0] for station in data.stations)
-        if kind == "section_loft"
-        else data.stations
         if kind == "loft"
+        else data.stations
+        if kind == "field_morph"
         else ()
     )
-    if kind in ("loft", "section_loft") and not (
+    if kind in ("field_morph", "loft") and not (
         len(positions) >= 2
         and all(_finite(position) for position in positions)
         and all(a < b for a, b in zip(positions, positions[1:], strict=False))
         and data.axes[0] in (0, 1, 2)
         and tuple(sorted((*data.axes[1], data.axes[0]))) == (0, 1, 2)
     ):
-        raise ValueError("loft needs ordered stations and valid axes")
+        raise ValueError(f"{kind} needs ordered stations and valid axes")
     if kind == "profile_sweep" and not (
         len(data.points) >= 2
         and len(data.frames) == len(data.points) - 1

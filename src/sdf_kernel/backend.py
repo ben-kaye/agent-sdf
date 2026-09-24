@@ -4,8 +4,6 @@ from math import atan2, pi, sqrt
 
 import numpy as np
 
-from .hit import Hit
-
 
 def _length(value):
     return np.linalg.norm(value, axis=-1)
@@ -236,11 +234,12 @@ def evaluate_shape(shape, points):
                 distance = np.minimum(distance, _segment(q, a, b))
             return distance - radius, zero
         if kind == "custom":
-            fn, material = data.fn, data.material_id
-            value = fn(*[q[..., axis] for axis in range(node.dim)])
-            distance, material = (
-                (value.distance, value.material) if isinstance(value, Hit) else (value, material)
-            )
+            from .field import evaluate as evaluate_field
+
+            coordinates = [q[..., axis] for axis in range(node.dim)]
+            coordinates.extend([0.0] * (3 - node.dim))
+            distance = evaluate_field(data.distance, *coordinates)
+            material = evaluate_field(data.material, *coordinates)
             return (
                 np.broadcast_to(np.asarray(distance), q.shape[:-1]),
                 np.broadcast_to(np.asarray(material, dtype=np.int32), q.shape[:-1]),
@@ -257,8 +256,18 @@ def evaluate_shape(shape, points):
             radius = data.radius
             h = np.maximum(radius - np.abs(da - db), 0) / radius
             return np.minimum(da, db) - h * h * radius * 0.25, np.where(da < db, ma, mb)
-        if kind == "translate":
-            return evaluate(child, q - np.asarray(data.offset))
+        if kind == "slice":
+            plane = data.plane
+            mapped = (
+                np.asarray(plane.origin)
+                + q[..., 0, None] * np.asarray(plane.x_direction)
+                + q[..., 1, None] * np.asarray(plane.y_direction)
+            )
+            return evaluate(child, mapped)
+        if kind == "warp":
+            warp = data.warp
+            distance, material = evaluate(child, warp.map_points(q))
+            return distance * warp.distance_scale, material
         if kind == "linear_pattern":
             step = np.asarray(data.step)
             best, material = evaluate(child, q)
@@ -280,29 +289,11 @@ def evaluate_shape(shape, points):
                 material = np.where(distance <= best, candidate, material)
                 best = np.minimum(best, distance)
             return best, material
-        if kind == "scale":
-            distance, material = evaluate(child, q / data.factor)
-            return distance * data.factor, material
         if kind == "transform":
             transform = data.transform
             mapped = transform.map_points(q)
             distance, material = evaluate(child, mapped)
             return distance * transform.distance_scale, material
-        if kind == "rotate":
-            angle, axis = data.angle, data.axis
-            c, s = np.cos(angle), np.sin(angle)
-            x, y = q[..., 0], q[..., 1]
-            if node.dim == 2:
-                mapped = np.stack((c * x + s * y, -s * x + c * y), axis=-1)
-            else:
-                z = q[..., 2]
-                if axis == "x":
-                    mapped = np.stack((x, c * y + s * z, -s * y + c * z), axis=-1)
-                elif axis == "y":
-                    mapped = np.stack((c * x - s * z, y, s * x + c * z), axis=-1)
-                else:
-                    mapped = np.stack((c * x + s * y, -s * x + c * y, z), axis=-1)
-            return evaluate(child, mapped)
         if kind == "offset":
             distance, material = evaluate(child, q)
             return distance - data.amount, material
@@ -314,7 +305,7 @@ def evaluate_shape(shape, points):
         if kind == "material":
             distance, _ = evaluate(child, q)
             return distance, zero + data.material_id
-        if kind in ("loft", "section_loft", "variable_extrude"):
+        if kind in ("field_morph", "loft", "variable_extrude"):
             from .operations import evaluate_operation
 
             return evaluate_operation(node, q, evaluate)

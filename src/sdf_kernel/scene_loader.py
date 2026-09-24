@@ -7,14 +7,15 @@ from pathlib import Path
 
 from .dsl import Shape
 from .materials import scene_materials
-from .model import Model
+from .model import Assembly, CompiledScene, Instance, Part, Scene, compile_scene
 
 
 @dataclass(frozen=True)
 class LoadedScene:
     source: Path
     scene: Shape
-    model: Model | None
+    object: Shape | Part | Assembly | Scene | Instance | CompiledScene
+    compiled: CompiledScene
     materials: dict
     views: object
 
@@ -30,13 +31,17 @@ def load_scene(source: str | Path) -> LoadedScene:
     finally:
         sys.path.pop(0)
 
-    model = namespace.get("MODEL")
-    model = model if isinstance(model, Model) else None
-    scene = namespace.get("SCENE")
-    if scene is None and model is not None:
-        scene = model.scene()
-    if not isinstance(scene, Shape) or scene.dim != 3:
+    object = namespace.get("SCENE")
+    if object is None:
+        model = namespace.get("MODEL")
+        if isinstance(model, (Part, Assembly, Instance)):
+            object = model
+    if object is None:
         raise ValueError(f"{source} must define a 3D SCENE or MODEL")
 
-    materials = scene_materials(model, namespace.get("MATERIALS"))
-    return LoadedScene(source, scene, model, materials, namespace.get("VIEWS"))
+    compiled = compile_scene(object)
+    if compiled.shape.dim != 3:
+        raise ValueError(f"{source} must define a 3D SCENE or MODEL")
+    materials = scene_materials(compiled.materials, namespace.get("MATERIALS"))
+    compiled = CompiledScene(compiled.shape, materials, compiled.parts)
+    return LoadedScene(source, compiled.shape, object, compiled, materials, namespace.get("VIEWS"))

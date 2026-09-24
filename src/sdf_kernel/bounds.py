@@ -2,7 +2,7 @@
 
 from collections import namedtuple
 from itertools import product
-from math import cos, hypot, inf, isfinite, sin
+from math import hypot, inf, isfinite
 
 
 def _coordinate(value):
@@ -103,13 +103,23 @@ def _affine(box, matrix, translation):
     )
 
 
-def _rotation(dim, angle, axis):
-    c, s = cos(angle), sin(angle)
-    matrix = [[float(i == j) for j in range(dim)] for i in range(dim)]
-    a, b = {"x": (1, 2), "y": (2, 0), "z": (0, 1)}[axis]
-    matrix[a][a] = matrix[b][b] = c
-    matrix[a][b], matrix[b][a] = -s, s
-    return matrix
+def _slice_bounds(box, plane):
+    if box.is_empty:
+        return _empty(2)
+    if not all(isfinite(x) for x in box.minimum + box.maximum):
+        return _unknown(2)
+    corners = tuple(product(*zip(box.minimum, box.maximum, strict=True)))
+    offsets = [tuple(p[i] - plane.origin[i] for i in range(3)) for p in corners]
+    distances = [sum(a * b for a, b in zip(p, plane.normal, strict=True)) for p in offsets]
+    if min(distances) > 0 or max(distances) < 0:
+        return _empty(2)
+    return _points_bounds(
+        tuple(
+            sum(a * b for a, b in zip(p, axis, strict=True))
+            for axis in (plane.x_direction, plane.y_direction)
+        )
+        for p in offsets
+    )
 
 
 def _analytic(shape, level=0.0):
@@ -171,12 +181,6 @@ def _analytic(shape, level=0.0):
         )
     if kind in ("material", "feature"):
         return _analytic(child, level)
-    if kind == "translate":
-        box = _analytic(child, level)
-        return AABB(
-            tuple(a + b for a, b in zip(box.minimum, data.offset, strict=True)),
-            tuple(a + b for a, b in zip(box.maximum, data.offset, strict=True)),
-        )
     if kind == "linear_pattern":
         box = _analytic(child, level)
         if box.is_empty:
@@ -199,21 +203,16 @@ def _analytic(shape, level=0.0):
         low[a] = low[b] = -radius
         high[a] = high[b] = radius
         return AABB(low, high)
-    if kind == "scale":
-        box = _analytic(child, level / data.factor)
-        return AABB(
-            tuple(x * data.factor for x in box.minimum), tuple(x * data.factor for x in box.maximum)
-        )
-    if kind == "rotate":
-        return _affine(_analytic(child, level), _rotation(dim, data.angle, data.axis), (0.0,) * dim)
     if kind == "transform":
         transform = data.transform
-        if transform.forward_affine is None:
-            return _unknown(dim)
         return _affine(
-            _analytic(child, level / transform.distance_scale), *transform.forward_affine
+            _analytic(child, level / transform.distance_scale), transform.matrix, transform.offset
         )
-    if kind in ("loft", "section_loft", "variable_extrude"):
+    if kind == "slice":
+        return _slice_bounds(_analytic(child, level), data.plane)
+    if kind == "warp":
+        return data.bounds if level <= 0 and data.bounds is not None else _unknown(dim)
+    if kind in ("field_morph", "loft", "variable_extrude"):
         from .operations import operation_bounds
 
         return operation_bounds(shape, level, _analytic)

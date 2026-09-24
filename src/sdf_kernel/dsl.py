@@ -26,16 +26,16 @@ from .shape_payloads import (
     RadialPattern,
     Radius,
     Rectangle,
-    Rotation,
-    Scale,
     Shell,
+    Slice,
     SmoothUnion,
     Torus,
     TransformPayload,
-    Translation,
+    WarpPayload,
     validate_shape,
 )
-from .transform import Transform, _Pose, _vector_args
+from .transform import Placement, Transform, _vector_args
+from .warp import Warp
 
 
 def _number(value: float) -> float:
@@ -62,6 +62,27 @@ def _point(values: Iterable[float], dim: int) -> tuple[float, ...]:
     if len(result) != dim:
         raise ValueError(f"expected {dim} coordinates")
     return result
+
+
+@dataclass(frozen=True, init=False)
+class LoftStation:
+    """Profile position, transverse offset, and positive scalar or pair scale."""
+
+    position: float
+    offset: tuple[float, float]
+    scale: tuple[float, float]
+
+    def __init__(self, position, *, offset=(0, 0), scale=1):
+        position = _number(position)
+        offset = _point(offset, 2)
+        scale = (
+            (_positive(scale),) * 2
+            if np.ndim(scale) == 0
+            else tuple(_positive(value) for value in _point(scale, 2))
+        )
+        object.__setattr__(self, "position", position)
+        object.__setattr__(self, "offset", offset)
+        object.__setattr__(self, "scale", scale)
 
 
 @dataclass(frozen=True)
@@ -125,41 +146,47 @@ class Shape:
         return Shape("smooth_union", self.dim, SmoothUnion(_positive(radius)), (self, other))
 
     def translate(self, *offset: float) -> Shape:
-        return Shape(
-            "translate", self.dim, Translation(_point(_vector_args(offset), self.dim)), (self,)
-        )
+        return self.transform(Transform.translation(*_point(_vector_args(offset), self.dim)))
 
     def rotate(self, angle: float, axis: str = "z") -> Shape:
-        if self.dim == 2 and axis != "z":
-            raise ValueError("2D sketches rotate around z")
-        if self.dim == 3 and axis not in ("x", "y", "z"):
-            raise ValueError("axis must be x, y, or z")
-        return Shape("rotate", self.dim, Rotation(_number(angle), axis), (self,))
+        return self.transform(Transform.rotation(angle, axis, dim=self.dim))
 
     def scale(self, factor: float) -> Shape:
-        return Shape("scale", self.dim, Scale(_positive(factor)), (self,))
+        return self.transform(Transform.scaling(*((_positive(factor),) * self.dim)))
 
     def transform(self, transform: Transform) -> Shape:
         if not isinstance(transform, Transform) or transform.dim != self.dim:
             raise ValueError("shape and transform dimensions must match")
         return Shape("transform", self.dim, TransformPayload(transform), (self,))
 
-    def place(
-        self,
-        translation=None,
-        *,
-        rotation_matrix=None,
-        axis_angle=None,
-        quaternion=None,
-        rpy=None,
-    ) -> Shape:
-        """Place a 3D solid; rpy angles are applied as Rz @ Ry @ Rx."""
+    def place(self, placement: Placement) -> Shape:
+        """Apply a reusable rigid placement to a 3D solid."""
         if self.dim != 3:
             raise ValueError("place requires a 3D solid; use profile.on(plane) for a 2D sketch")
-        pose = _Pose.from_components(
-            translation, R=rotation_matrix, aa=axis_angle, q=quaternion, rpy=rpy
-        )
-        return Shape("transform", 3, TransformPayload(pose.as_transform()), (self,))
+        if not isinstance(placement, Placement):
+            raise ValueError("place requires a Placement")
+        return self.transform(placement.as_transform())
+
+    def warp(self, warp: Warp, *, bounds=None) -> Shape:
+        """Apply a nonlinear map; supply enclosing bounds for bounds queries/rendering."""
+        from .bounds import as_aabb
+
+        if not isinstance(warp, Warp) or warp.dim != self.dim:
+            raise ValueError("shape and warp dimensions must match")
+        bounds = None if bounds is None else as_aabb(bounds, self.dim)
+        return Shape("warp", self.dim, WarpPayload(warp, bounds), (self,))
+
+    def slice(self, plane: Plane) -> Shape:
+        """Restrict a 3D field exactly to plane-local (x, y), without redistancing."""
+        if self.dim != 3 or not isinstance(plane, Plane):
+            raise ValueError("slice requires a 3D shape and a Plane")
+        return Shape("slice", 2, Slice(plane), (self,))
+
+    def contours(self, bounds, *, resolution=128, step=None):
+        """Sample a 2D field's zero contours in its local coordinates."""
+        from .section import contours
+
+        return contours(self, bounds, resolution=resolution, step=step)
 
     def on(self, plane: Plane) -> Sketch:
         """Place this 2D profile's (x, y) coordinates on a plane."""
@@ -190,7 +217,7 @@ class Shape:
         return Shape("material", 3, Material(validate_material_id(material_id)), (self,))
 
     def named(self, name: str) -> Shape:
-        """Name this field as one surface feature for geometry queries."""
+        """Add a feature scope, preserving the names of constituent features."""
         if not isinstance(name, str) or not name.isidentifier():
             raise ValueError("feature name must be a Python identifier")
         return Shape("feature", self.dim, Feature(name), (self,))
@@ -205,10 +232,10 @@ class Shape:
 
         return pick(self, x, y, width, height, **kwargs)
 
-    def section(self, origin, normal, bounds, **kwargs):
+    def section(self, plane: Plane, bounds, **kwargs):
         from .section import section
 
-        return section(self, origin, normal, bounds, **kwargs)
+        return section(self, plane, bounds, **kwargs)
 
     def extrude(
         self, height, *, offset=0.0, bounds=None, height_lipschitz=None, offset_lipschitz=None
@@ -233,15 +260,15 @@ class Shape:
             offset_lipschitz=offset_lipschitz,
         )
 
-    def loft(self, stations, *, axis="z") -> Shape:
-        """Loft through (position, offset_u, offset_v, scale_u, scale_v).
+    def loft(self, stations: Iterable[LoftStation], *, axis="z") -> Shape:
+        """Linearly interpolate one profile's offsets and scales at LoftStations.
 
-        Scales must be positive. Returns a capped implicit distance estimate;
+        Returns a flat-capped implicit distance estimate;
         transverse coordinates follow world axis order (Y/Z for axis='x').
         """
-        from .operations import section_loft
+        from .operations import loft
 
-        return section_loft(self, stations, axis=axis)
+        return loft(self, stations, axis=axis)
 
     def sweep(self, curve, *, tolerance=0.01, up=None, closed=False) -> Shape:
         """Sweep along a 2D/3D curve with transported frames and mitered joins.
@@ -291,13 +318,7 @@ class Sketch:
             raise ValueError("revolution axis must be sketch-local x or y")
         profile = self.profile
         if axis == "x":
-            profile = profile.transform(
-                Transform(
-                    2,
-                    lambda p: p[::-1],
-                    forward_affine=(((0.0, 1.0), (1.0, 0.0)), (0.0, 0.0)),
-                )
-            )
+            profile = profile.transform(Transform(((0.0, 1.0), (1.0, 0.0))))
         profile = profile | profile.transform(Transform.scaling(-1, 1))
         solid = Shape("revolve", 3, Empty(), (profile,))
         radial, axial = (
@@ -307,7 +328,7 @@ class Sketch:
         )
         tangent = _cross(axial, radial)
         rotation = tuple((radial[i], tangent[i], axial[i]) for i in range(3))
-        return solid.transform(_Pose(self.plane.origin, rotation).as_transform())
+        return solid.place(Placement(self.plane.origin, rotation_matrix=rotation))
 
 
 def _same_dim(a: Shape, b: Shape) -> None:
@@ -398,11 +419,15 @@ def polygon(points: Iterable[Iterable[float]]) -> Shape:
     return Shape("polygon", 2, Polygon(pts))
 
 
-def loft(sections, *, axis="z") -> Shape:
-    """Morph between (position, 2D profile) sections with flat end caps."""
-    from .operations import loft as make_loft
+def field_morph(sections, *, axis="z") -> Shape:
+    """Blend fields at (position, 2D profile) sections into a flat-capped solid.
 
-    return make_loft(sections, axis=axis)
+    Linear interpolation at fixed transverse coordinates can erase interiors.
+    Returns an implicit distance estimate; transverse axes follow world order.
+    """
+    from .operations import field_morph as make_field_morph
+
+    return make_field_morph(sections, axis=axis)
 
 
 # Solid primitives use Z as their main axis and are centered at the origin.
@@ -433,11 +458,11 @@ def capsule(start: Iterable[float], end: Iterable[float], radius: float) -> Shap
     return Shape("capsule", 3, Capsule(a, b, _positive(radius)))
 
 
-def custom_sdf(
-    fn, dim: int = 3, material_id: int = 0, *, bounds=None, lipschitz: float | None = None
-) -> Shape:
-    """Compose a symbolic distance field; bounds enclose f <= 0 in local coordinates.
+def custom_sdf(fn, dim: int = 3, material_id: int = 0, *, lipschitz: float, bounds=None) -> Shape:
+    """Capture a renderable scalar field; bounds enclose f <= 0 locally.
 
+    The callable receives symbolic coordinates once. Its result must be a
+    scalar distance or Hit(distance, material), using field-aware math.
     lipschitz promises |f(p)-f(q)| <= L*|p-q|; use 1 for a true SDF.
     """
     if dim not in (2, 3):
@@ -446,7 +471,23 @@ def custom_sdf(
         raise ValueError("custom SDF needs a callable")
     material_id = validate_material_id(material_id)
     from .bounds import as_aabb
+    from .field import as_scalar, compile_glsl, coordinates, to_glsl
 
     bounds = None if bounds is None else as_aabb(bounds, dim)
-    lipschitz = None if lipschitz is None else _positive(lipschitz)
-    return Shape("custom", dim, Custom(fn, material_id, bounds, lipschitz))
+    lipschitz = _positive(lipschitz)
+    try:
+        value = fn(*coordinates()[:dim])
+        distance, material = (
+            (value.distance, value.material) if isinstance(value, Hit) else (value, material_id)
+        )
+        distance, material = as_scalar(distance), as_scalar(material)
+        if distance.kind != "float" or material.kind != "float":
+            raise TypeError("distance and material must be numeric scalar fields")
+        compile_glsl(distance)
+        to_glsl(material)
+    except Exception as exc:
+        raise ValueError(
+            "custom_sdf callable must return a renderable scalar field; "
+            "use symbolic coordinates and sdf_kernel.math operations"
+        ) from exc
+    return Shape("custom", dim, Custom(distance, material, bounds, lipschitz))

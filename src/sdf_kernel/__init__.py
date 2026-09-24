@@ -5,6 +5,7 @@ from .bounds import AABB
 from .bvh import BVHNode
 from .curves import Curve
 from .dsl import (
+    LoftStation,
     Shape,
     Sketch,
     box,
@@ -12,7 +13,7 @@ from .dsl import (
     circle,
     custom_sdf,
     cylinder,
-    loft,
+    field_morph,
     max_,
     min_,
     polygon,
@@ -21,34 +22,43 @@ from .dsl import (
     torus,
 )
 from .hit import Hit
-from .model import Model
+from .materials import Material
+from .model import Assembly, Instance, Part, Scene
 from .plane import Plane
 from .query import SurfaceHit, distance_between, pick, ray_cast
 from .renderer import render
-from .section import Section, SectionContour, section
-from .transform import Transform
+from .section import Contour, Section, section
+from .transform import Placement, Transform
+from .warp import Warp
 
 __all__ = [
     "AABB",
     "AnchorPlane",
+    "Assembly",
     "BVHNode",
+    "Contour",
     "Curve",
     "Hit",
+    "LoftStation",
+    "Instance",
+    "Material",
+    "Part",
+    "Scene",
     "Section",
-    "SectionContour",
     "SurfaceHit",
-    "Model",
     "Plane",
+    "Placement",
     "Shape",
     "Sketch",
     "Transform",
+    "Warp",
     "box",
     "capsule",
     "circle",
     "custom_sdf",
     "cylinder",
     "distance_between",
-    "loft",
+    "field_morph",
     "max_",
     "min_",
     "polygon",

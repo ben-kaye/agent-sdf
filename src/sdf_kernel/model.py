@@ -1,154 +1,80 @@
-"""Named CSG history and material definitions."""
+"""Reusable parts, nested assemblies, and independently placed scene objects."""
 
 from __future__ import annotations
 
-from .dsl import Shape, _positive, max_, min_
-from .materials import PALETTE, finish
-from .transform import Transform
+from collections.abc import Mapping
+from dataclasses import dataclass
+from types import MappingProxyType
+
+import numpy as np
+
+from .anchor import AnchorPlane
+from .dsl import Shape, min_
+from .materials import PALETTE, Material, validate_material_id
+from .plane import Plane
+from .shape_payloads import Feature
+from .shape_payloads import Material as MaterialPayload
+from .transform import Placement, _vector3
 
 
-class Model:
-    """Named, ordered CSG history. Every apply step depends on earlier fields."""
+def _name(value, label):
+    if not isinstance(value, str) or not value.isidentifier():
+        raise ValueError(f"{label} must be a Python identifier")
+    return value
 
-    def __init__(self):
-        self._shapes: dict[str, Shape] = {}
-        self._history: list[dict] = []
-        self._current: str | None = None
-        self._materials: dict[str, dict] = {}
 
-    def material(
-        self,
-        name: str,
-        *,
-        base_color: str,
-        metallic: float = 0.0,
-        roughness: float = 0.8,
-        opacity: float = 1.0,
-    ) -> int:
-        """Define a named finish and return its ID for Shape geometry."""
-        if not isinstance(name, str) or not name.isidentifier():
-            raise ValueError("material name must be a Python identifier")
-        if name in self._materials:
-            raise ValueError(f"material already exists: {name}")
-        index = len(PALETTE) + len(self._materials)
-        if index > 4095:
-            raise ValueError("model cannot define more than 4087 materials")
-        self._materials[name] = {"id": index, **finish(base_color, metallic, roughness, opacity)}
-        return index
+def _mapping(value, label):
+    if value is None:
+        return {}
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{label} must be a mapping")
+    return dict(value)
 
-    def materials(self) -> dict[str, dict]:
-        """Return JSON-compatible material definitions."""
-        return {name: definition.copy() for name, definition in self._materials.items()}
 
-    def _check_name(self, name: str) -> None:
-        if not isinstance(name, str) or not name.isidentifier():
-            raise ValueError("feature name must be a Python identifier")
-        if name in self._shapes:
-            raise ValueError(f"feature already exists: {name}")
+def _place_datum(value, placement):
+    rotation = np.asarray(placement.rotation)
 
-    def define(self, name: str, shape: Shape) -> Shape:
-        """Register an independent field without changing the active result."""
-        self._check_name(name)
-        if not isinstance(shape, Shape):
-            raise ValueError("feature must be a Shape")
-        result = shape.named(name)
-        self._shapes[name] = result
-        self._history.append({"name": name, "op": "define", "depends_on": []})
-        return result
+    def point(p):
+        return tuple(float(v) for v in rotation @ p + placement.translation)
 
-    def start(self, name: str, shape: Shape) -> Shape:
-        """Register the initial field and make it the active result."""
-        if not isinstance(shape, Shape) or shape.dim != 3:
-            raise ValueError("model result must be 3D")
-        result = self.define(name, shape)
-        self._current = name
-        return result
-
-    def transform(self, name: str, source: str, transform: Transform) -> Shape:
-        """Define a transformed feature from a previously named field."""
-        self._check_name(name)
-        if source not in self._shapes:
-            raise ValueError("source must name a previously defined field")
-        result = self._shapes[source].transform(transform).named(name)
-        self._shapes[name] = result
-        self._history.append({"name": name, "op": "transform", "depends_on": [source]})
-        return result
-
-    def place(
-        self,
-        name: str,
-        source: str,
-        translation=None,
-        *,
-        rotation_matrix=None,
-        axis_angle=None,
-        quaternion=None,
-        rpy=None,
-    ) -> Shape:
-        """Define a placed 3D feature from a previously named solid."""
-        self._check_name(name)
-        if source not in self._shapes:
-            raise ValueError("source must name a previously defined field")
-        result = self._shapes[source].place(
-            translation,
-            rotation_matrix=rotation_matrix,
-            axis_angle=axis_angle,
-            quaternion=quaternion,
-            rpy=rpy,
+    if isinstance(value, Placement):
+        return value.then(placement)
+    if isinstance(value, Plane):
+        plane_type = AnchorPlane if isinstance(value, AnchorPlane) else Plane
+        result = plane_type(
+            point(value.origin),
+            tuple(rotation @ value.normal),
+            x_direction=tuple(rotation @ value.x_direction),
         )
-        result = result.named(name)
-        self._shapes[name] = result
-        self._history.append({"name": name, "op": "place", "depends_on": [source]})
+        if isinstance(value, AnchorPlane):
+            object.__setattr__(result, "_points", MappingProxyType(value.points()))
         return result
+    return point(value)
 
-    def apply(
-        self, name: str, op: str, tool: str, *, base: str | None = None, radius: float | None = None
-    ) -> Shape:
-        """Apply a named field to the active result (or an explicit earlier base)."""
-        self._check_name(name)
-        base = self._current if base is None else base
-        if base not in self._shapes or tool not in self._shapes:
-            raise ValueError("base and tool must name previously defined fields")
-        if op not in ("min", "max", "subtract", "smooth_union"):
-            raise ValueError("op must be min, max, subtract, or smooth_union")
-        if op != "smooth_union" and radius is not None:
-            raise ValueError("radius is only valid for smooth_union")
-        a, b = self._shapes[base], self._shapes[tool]
-        if a.dim != b.dim:
-            raise ValueError("base and tool must have the same dimension")
-        if a.dim != 3:
-            raise ValueError("model result must be 3D")
-        if op == "min":
-            result = min_(a, b)
-        elif op == "max":
-            result = max_(a, b)
-        elif op == "subtract":
-            result = a - b
-        else:
-            if radius is None:
-                raise ValueError("smooth_union requires radius")
-            result = a.smooth_union(b, _positive(radius))
-        self._shapes[name] = result
-        self._history.append(
-            {
-                "name": name,
-                "op": op,
-                "depends_on": [base, tool],
-                **({"radius": radius} if op == "smooth_union" else {}),
-            }
-        )
-        self._current = name
-        return result
 
-    def scene(self, name: str | None = None) -> Shape:
-        key = self._current if name is None else name
-        if key not in self._shapes or self._shapes[key].dim != 3:
-            raise ValueError("scene must name a 3D model field")
-        return self._shapes[key]
+def _datums(values):
+    result = {}
+    for name, value in _mapping(values, "datums").items():
+        _name(name, "datum name")
+        if not isinstance(value, (Plane, Placement)):
+            value = _vector3(value, "point datum")
+        result[name] = _place_datum(value, Placement())
+    return MappingProxyType(result)
 
-    def history(self) -> list[dict]:
-        """JSON-compatible feature order and direct dependencies."""
-        return [dict(step, depends_on=list(step["depends_on"])) for step in self._history]
+
+class _Object:
+    def to_shape(self) -> Shape:
+        """Explicitly combine the placed part fields into one union field."""
+        return compile_scene(self).shape
+
+    def bounds(self, scene_bounds=None, **kwargs):
+        return self.to_shape().bounds(scene_bounds, **kwargs)
+
+    def extents(self, scene_bounds=None, **kwargs):
+        return self.bounds(scene_bounds, **kwargs).extents
+
+    def bvh(self, scene_bounds=None, **kwargs):
+        return self.to_shape().bvh(scene_bounds, **kwargs)
 
     def ray_cast(self, origin, direction, **kwargs):
         from .query import ray_cast
@@ -160,7 +86,273 @@ class Model:
 
         return pick(self, x, y, width, height, **kwargs)
 
-    def section(self, origin, normal, bounds, **kwargs):
+    def slice(self, plane):
+        return self.to_shape().slice(plane)
+
+    def section(self, plane, bounds, **kwargs):
         from .section import section
 
-        return section(self, origin, normal, bounds, **kwargs)
+        return section(self, plane, bounds, **kwargs)
+
+
+class _Placeable(_Object):
+    def at(self, placement: Placement) -> Instance:
+        """Create an occurrence without changing this definition."""
+        return Instance(self, placement)
+
+
+@dataclass(frozen=True, init=False, eq=False)
+class Part(_Placeable):
+    """One local geometry expression, its materials, and exported datums."""
+
+    shape: Shape
+    materials: Mapping[int, Material]
+    datums: Mapping
+    metadata: Mapping
+
+    def __init__(self, shape, *, material=None, materials=None, datums=None, metadata=None):
+        if not isinstance(shape, Shape) or shape.dim != 3:
+            raise ValueError("a Part requires a 3D Shape")
+        definitions = _mapping(materials, "materials")
+        if material is not None:
+            if not isinstance(material, Material):
+                raise ValueError("part material must be a Material")
+            if definitions:
+                raise ValueError("provide material or local materials, not both")
+            shape = shape.with_material(0)
+            definitions = {0: material}
+        named_materials = {}
+        for key, value in definitions.items():
+            validate_material_id(key)
+            if not isinstance(value, Material):
+                raise ValueError("part materials must map local IDs to Material values")
+            if value.name in named_materials and named_materials[value.name] != value:
+                raise ValueError(f"part material name has conflicting definitions: {value.name}")
+            named_materials[value.name] = value
+        object.__setattr__(self, "shape", shape)
+        object.__setattr__(self, "materials", MappingProxyType(definitions))
+        object.__setattr__(self, "datums", _datums(datums))
+        object.__setattr__(self, "metadata", MappingProxyType(_mapping(metadata, "metadata")))
+
+    def datum(self, name):
+        """Read an exported datum in part-local coordinates."""
+        return self.datums[name]
+
+
+@dataclass(frozen=True, eq=False)
+class Instance(_Placeable):
+    """A part or assembly definition with a placement relative to its parent."""
+
+    definition: Part | Assembly
+    placement: Placement = Placement()
+
+    def __post_init__(self):
+        if not isinstance(self.definition, (Part, Assembly)):
+            raise ValueError("an instance requires a Part or Assembly definition")
+        if not isinstance(self.placement, Placement):
+            raise ValueError("instance placement must be a Placement")
+
+    def at(self, placement: Placement) -> Instance:
+        """Apply an additional placement in parent coordinates."""
+        return Instance(self.definition, self.placement.then(placement))
+
+    @property
+    def datums(self):
+        return MappingProxyType(
+            {
+                name: _place_datum(value, self.placement)
+                for name, value in self.definition.datums.items()
+            }
+        )
+
+    def datum(self, path):
+        """Resolve a datum into this instance's parent coordinates."""
+        return _place_datum(self.definition.datum(path), self.placement)
+
+
+class _Composition(_Object):
+    def __init__(self, components=None, *, datums=None, metadata=None, **named_components):
+        self._components: dict[str, Instance] = {}
+        self._datums = _datums(datums)
+        self._metadata = MappingProxyType(_mapping(metadata, "metadata"))
+        for name, value in _mapping(components, "components").items():
+            self.add(name, value)
+        for name, value in named_components.items():
+            self.add(name, value)
+
+    @property
+    def components(self):
+        return MappingProxyType(self._components)
+
+    @property
+    def datums(self):
+        return self._datums
+
+    @property
+    def metadata(self):
+        return self._metadata
+
+    def __getitem__(self, name):
+        return self._components[name]
+
+    def add(self, name, value) -> Instance:
+        """Add a named component, preserving its definition and local placement."""
+        _name(name, "component name")
+        if name in self._components:
+            raise ValueError(f"component already exists: {name}")
+        instance = value if isinstance(value, Instance) else Instance(value)
+        visited = set()
+
+        def contains(definition):
+            if definition is self:
+                return True
+            if not isinstance(definition, Assembly) or id(definition) in visited:
+                return False
+            visited.add(id(definition))
+            return any(contains(child.definition) for child in definition.components.values())
+
+        if contains(instance.definition):
+            raise ValueError("assembly components cannot form a cycle")
+        self._components[name] = instance
+        return instance
+
+    def datum(self, path):
+        """Resolve an exported datum, optionally through a component/name path."""
+        if not isinstance(path, str) or not path:
+            raise ValueError("datum path must be a nonempty string")
+        first, separator, rest = path.partition("/")
+        if not separator:
+            return self.datums[first]
+        return self.components[first].datum(rest)
+
+
+class Assembly(_Composition, _Placeable):
+    """A reusable local composition of named Part and Assembly instances."""
+
+
+class Scene(_Composition):
+    """The world root of independently placed Part and Assembly instances."""
+
+
+@dataclass(frozen=True)
+class CompiledPart:
+    path: tuple[str, ...]
+    shape: Shape
+    part: Part | None
+    placement: Placement
+
+
+@dataclass(frozen=True)
+class CompiledScene:
+    shape: Shape
+    materials: dict
+    parts: tuple[CompiledPart, ...]
+
+
+def _prepare_features(shape, prefix=()):
+    """Lower nested feature scopes to leaf labels without losing constituent names."""
+    cache = {}
+
+    def visit(node, scope):
+        key = (id(node), scope)
+        if key in cache:
+            return cache[key]
+        if node.kind == "feature":
+            result = visit(node.children[0], (*scope, node.data.name))
+        elif node.children:
+            result = Shape(
+                node.kind, node.dim, node.data, tuple(visit(c, scope) for c in node.children)
+            )
+        elif scope:
+            result = Shape("feature", node.dim, Feature("/".join(scope)), (node,))
+        else:
+            result = node
+        cache[key] = result
+        return result
+
+    return visit(shape, tuple(prefix))
+
+
+def _remap_materials(shape, mapping):
+    cache = {}
+
+    def material_id(value):
+        return mapping.get(value, value % len(PALETTE))
+
+    def remap_custom_material(original):
+        from .math import floor, where
+
+        result = original - floor(original / len(PALETTE)) * len(PALETTE)
+        for local, global_id in mapping.items():
+            result = where(original == local, global_id, result)
+        return result
+
+    def visit(node):
+        key = id(node)
+        if key in cache:
+            return cache[key]
+        data = node.data
+        if node.kind == "material":
+            data = MaterialPayload(material_id(data.material_id))
+            children = node.children
+        else:
+            children = tuple(visit(c) for c in node.children)
+        if node.kind == "custom":
+            data = data._replace(material=remap_custom_material(data.material))
+        result = Shape(node.kind, node.dim, data, children)
+        if not children and node.kind != "custom" and 0 in mapping:
+            result = Shape("material", node.dim, MaterialPayload(mapping[0]), (result,))
+        cache[key] = result
+        return result
+
+    return visit(shape)
+
+
+def compile_scene(value) -> CompiledScene:
+    """Resolve instance placements, material bindings, and qualified feature labels."""
+    if isinstance(value, CompiledScene):
+        return value
+    if isinstance(value, Shape):
+        if value.dim != 3:
+            raise ValueError("a scene requires 3D geometry")
+        shape = _prepare_features(value)
+        return CompiledScene(shape, {}, (CompiledPart((), shape, None, Placement()),))
+    if not isinstance(value, (Part, Assembly, Scene, Instance)):
+        raise ValueError("expected a 3D Shape, Part, Assembly, Instance, or Scene")
+    parts = []
+    materials = {}
+    material_ids = {}
+    active = set()
+    prepared = {}
+
+    def visit(obj, path, placement):
+        if isinstance(obj, Instance):
+            visit(obj.definition, path, obj.placement.then(placement))
+        elif isinstance(obj, Part):
+            if id(obj) not in prepared:
+                mapping = {}
+                for local, material in obj.materials.items():
+                    if material not in material_ids:
+                        index = len(PALETTE) + len(material_ids)
+                        validate_material_id(index)
+                        material_ids[material] = index
+                        name = "/".join((*path, material.name))
+                        materials[name] = {"id": index, **material.finish()}
+                    mapping[local] = material_ids[material]
+                prepared[id(obj)] = _remap_materials(obj.shape, mapping)
+            shape = _prepare_features(prepared[id(obj)], path).place(placement)
+            parts.append(CompiledPart(path, shape, obj, placement))
+        else:
+            key = id(obj)
+            if key in active:
+                raise ValueError("assembly components cannot form a cycle")
+            active.add(key)
+            for name, instance in obj.components.items():
+                visit(instance, (*path, name), placement)
+            active.remove(key)
+
+    visit(value, (), Placement())
+    if not parts:
+        raise ValueError("cannot evaluate a composition containing no parts")
+    shape = min_(*(part.shape for part in parts))
+    return CompiledScene(shape, materials, tuple(parts))

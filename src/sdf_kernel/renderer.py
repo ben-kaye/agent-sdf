@@ -10,7 +10,7 @@ import os
 import shutil
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from math import isfinite, sqrt
+from math import isfinite
 from pathlib import Path
 
 import numpy as np
@@ -18,11 +18,11 @@ from PIL import Image
 from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import sync_playwright
 
-from .bvh import _union_components
-from .dsl import Shape, min_
+from .camera import _orientation, _orientation_up
+from .dsl import min_
 from .glsl import compile_glsl
 from .materials import material_arrays, scene_materials
-from .model import Model
+from .model import CompiledScene, compile_scene
 from .scene_loader import load_scene
 from .smaa import smaa
 from .transform import _vector3
@@ -80,24 +80,6 @@ def _fxaa(image):
     outer_luma = outer @ np.array((0.299, 0.587, 0.114), dtype=np.float32)
     blended = np.where(((outer_luma < minimum) | (outer_luma > maximum))[..., None], inner, outer)
     return np.where(edge[..., None], blended, rgb).astype(np.uint8)
-
-
-def _orientation(value):
-    try:
-        result = tuple(float(component) for component in value)
-    except (TypeError, ValueError) as exc:
-        raise ValueError("orientation must be four finite numbers (w, x, y, z)") from exc
-    if len(result) != 4 or not all(isfinite(component) for component in result):
-        raise ValueError("orientation must be four finite numbers (w, x, y, z)")
-    length = sqrt(sum(component * component for component in result))
-    if length < 1e-8:
-        raise ValueError("orientation must be a nonzero quaternion")
-    return tuple(component / length for component in result)
-
-
-def _orientation_up(orientation):
-    w, x, y, z = orientation
-    return (2 * (x * y - w * z), 1 - 2 * (x * x + z * z), 2 * (y * z + w * x))
 
 
 def _scene_bounds(scene):
@@ -214,21 +196,22 @@ def _node_count(scene):
     return len(seen)
 
 
-def _render_chunked(scene, config, width, height):
-    components = _union_components(scene)
-    if len(components) < 2:
-        return _render_webgl(compile_glsl(scene), config, width, height)
+def _render_chunked(compiled, config, width, height):
+    parts = compiled.parts
+    if len(parts) < 2:
+        return _render_webgl(compile_glsl(compiled), config, width, height)
     layers = []
     depths = []
     start = 0
-    while start < len(components):
-        end = min(start + 100, len(components))
-        part = min_(*components[start:end])
-        while _node_count(part) > 900 and end > start + 1:
+    while start < len(parts):
+        end = min(start + 100, len(parts))
+        shape = min_(*(part.shape for part in parts[start:end]))
+        while _node_count(shape) > 900 and end > start + 1:
             end = start + (end - start) // 2
-            part = min_(*components[start:end])
-        shader = compile_glsl(part)
-        part_config = {**config, "bounds": _scene_bounds(part)}
+            shape = min_(*(part.shape for part in parts[start:end]))
+        group = CompiledScene(shape, compiled.materials, parts[start:end])
+        shader = compile_glsl(group)
+        part_config = {**config, "bounds": _scene_bounds(shape)}
         color = _render_webgl(shader, {**part_config, "captureMode": 1}, width, height)
         depth = _render_webgl(shader, {**part_config, "captureMode": 2}, width, height)
         layers.append(np.asarray(color, dtype=np.uint8))
@@ -268,13 +251,11 @@ def render(
     orientation=None,
 ):
     """Render a scene with the same GLSL program used by the browser viewer."""
-    if isinstance(scene, Model):
-        materials = scene_materials(scene, materials)
-        scene = scene.scene()
-    else:
-        materials = scene_materials(None, materials)
-    if not isinstance(scene, Shape) or scene.dim != 3:
-        raise ValueError("render needs a 3D Shape or Model")
+    compiled = compile_scene(scene)
+    scene = compiled.shape
+    materials = scene_materials(compiled.materials, materials)
+    if scene.dim != 3:
+        raise ValueError("render needs a 3D scene")
     if not 1 <= width <= 2048 or not 1 <= height <= 2048:
         raise ValueError("width and height must be from 1 to 2048")
     if aa not in ("auto", "none", "fxaa", "smaa", "ssaa", "adaptive"):
@@ -308,9 +289,9 @@ def render(
     scale = 2 if mode in ("ssaa", "adaptive") else 1
     config = _config(scene, materials, eye, target, fov, camera_size, far, final, up, orientation)
     if _node_count(scene) > 1000:
-        image = _render_chunked(scene, config, width * scale, height * scale)
+        image = _render_chunked(compiled, config, width * scale, height * scale)
     else:
-        shader = compile_glsl(scene, bvh=bvh)
+        shader = compile_glsl(compiled, bvh=bvh)
         image = _render_webgl(shader, config, width * scale, height * scale)
     if scale > 1:
         image = image.resize((width, height), Image.Resampling.LANCZOS)
@@ -343,7 +324,7 @@ def main():
     try:
         loaded = load_scene(args.source)
         image = render(
-            loaded.scene,
+            loaded.compiled,
             args.width,
             args.height,
             args.eye,
@@ -378,8 +359,9 @@ def main():
         "bvh": args.bvh,
         "aa": ("ssaa" if args.final else "none") if args.aa == "auto" else args.aa,
     }
-    if loaded.model is not None:
-        metadata["features"] = loaded.model.history()
+    component_paths = ["/".join(part.path) for part in loaded.compiled.parts if part.path]
+    if component_paths:
+        metadata["components"] = component_paths
     if loaded.materials:
         metadata["materials"] = loaded.materials
     output.with_suffix(".json").write_text(json.dumps(metadata, indent=2) + "\n")

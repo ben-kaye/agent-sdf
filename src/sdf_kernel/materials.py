@@ -2,6 +2,7 @@
 
 import re
 from collections.abc import Mapping
+from dataclasses import dataclass
 from math import isfinite
 
 import numpy as np
@@ -17,6 +18,28 @@ PALETTE = (
     (190, 52, 45),
     (178, 184, 187),
 )
+
+
+@dataclass(frozen=True)
+class Material:
+    """A reusable named finish, independent of renderer material IDs."""
+
+    name: str
+    base_color: str
+    metallic: float = 0.0
+    roughness: float = 0.8
+    opacity: float = 1.0
+
+    def __post_init__(self):
+        if not isinstance(self.name, str) or not self.name.isidentifier():
+            raise ValueError("material name must be a Python identifier")
+        for key, value in finish(
+            self.base_color, self.metallic, self.roughness, self.opacity
+        ).items():
+            object.__setattr__(self, key, value)
+
+    def finish(self):
+        return finish(self.base_color, self.metallic, self.roughness, self.opacity)
 
 
 def validate_material_id(value):
@@ -54,8 +77,8 @@ def normalize_materials(materials):
     result = {}
     used_ids = set()
     for name, definition in materials.items():
-        if not isinstance(name, str) or not name.isidentifier():
-            raise ValueError("material name must be a Python identifier")
+        if not isinstance(name, str) or not all(part.isidentifier() for part in name.split("/")):
+            raise ValueError("material name must contain identifier path segments")
         if not isinstance(definition, Mapping):
             raise ValueError(f"material {name} must be a finish definition")
         index = validate_material_id(definition.get("id"))
@@ -96,7 +119,7 @@ def material_arrays(materials):
     )
 
 
-def scene_materials(model, external=None):
-    result = model.materials() if model is not None else {}
+def scene_materials(base=None, external=None):
+    result = normalize_materials(base)
     result.update(normalize_materials(external))
     return normalize_materials(result)

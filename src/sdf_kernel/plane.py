@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from math import hypot
 
-from .transform import Transform, _finite, _Pose, _vector3
+from .transform import Placement, Transform, _finite, _vector3
 
 
 def _dot(a, b):
@@ -90,9 +90,12 @@ class Plane:
             raise ValueError("world point must lie on the plane")
         return _dot(delta, self.x_direction), _dot(delta, self.y_direction)
 
-    def as_transform(self) -> Transform:
-        """Map local (x, y, normal) coordinates into world coordinates."""
+    def as_placement(self) -> Placement:
+        """Place local (x, y, normal) coordinates in world space."""
         rotation = tuple(
             (self.x_direction[i], self.y_direction[i], self.normal[i]) for i in range(3)
         )
-        return _Pose(self.origin, rotation).as_transform()
+        return Placement(self.origin, rotation_matrix=rotation)
+
+    def as_transform(self) -> Transform:
+        return self.as_placement().as_transform()
