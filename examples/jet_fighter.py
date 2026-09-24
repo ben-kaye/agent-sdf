@@ -1,85 +1,25 @@
-"""Detailed twin-engine fighter built entirely with the agent_sdf SDK.
+"""Twin-engine fighter assembled from SDK sketches and solids."""
 
-Coordinates are metres: +X points toward the nose, Z is up.  Run with
-`.venv/bin/python -m sdf_kernel.renderer jet_fighter.py -o renders/jet-fighter.png
- --width 320 --height 240 --eye 17 -22 10 --target 0 0 0 --far 45`.
-"""
+import math
 
-from sdf_kernel import Hit, Model, custom_sdf, max_, min_
+from sdf_kernel import Model, Transform, box, capsule, circle, cylinder, max_, min_, polygon, sphere
 from sdf_kernel import math as field_math
 
-# Renderer palette indices: warm titanium, charcoal composite, blue glass,
-# warning red, and bright alloy.  The explicit finish data also documents the
-# intended real-world material treatment independently of preview lighting.
-MATERIALS = {
-    "airframe": {"id": 8, "base_color": "#929a9d", "metallic": 0.72, "roughness": 0.43},
-    "radome": {"id": 5, "base_color": "#292e32", "metallic": 0.08, "roughness": 0.72},
-    "canopy": {"id": 6, "base_color": "#263e4a", "metallic": 0.15, "roughness": 0.11},
-    "engine": {"id": 4, "base_color": "#353839", "metallic": 0.75, "roughness": 0.62},
-    "missile": {"id": 0, "base_color": "#dedbd2", "metallic": 0.26, "roughness": 0.4},
-    "marking": {"id": 7, "base_color": "#a84237", "metallic": 0.1, "roughness": 0.58},
-}
+
+def block(x, y, z, hx, hy, hz, radius=0):
+    return box(2 * hx, 2 * hy, 2 * hz, radius).translate(x, y, z)
 
 
-def box(x, y, z, cx, cy, cz, hx, hy, hz):
-    qx, qy, qz = (
-        field_math.abs(x - cx) - hx,
-        field_math.abs(y - cy) - hy,
-        field_math.abs(z - cz) - hz,
-    )
-    ox, oy, oz = max_(qx, 0), max_(qy, 0), max_(qz, 0)
-    return field_math.sqrt(ox * ox + oy * oy + oz * oz) + min_(max_(qx, max_(qy, qz)), 0)
+def x_cylinder(x, y, z, length, radius):
+    return cylinder(radius, length).rotate(math.pi / 2, "y").translate(x, y, z)
 
 
-def rounded_box(x, y, z, cx, cy, cz, hx, hy, hz, radius):
-    return box(x, y, z, cx, cy, cz, hx - radius, hy - radius, hz - radius) - radius
+def xz_polygon(points, thickness, y=0):
+    return polygon(points).extrude(thickness).rotate(math.pi / 2, "x").translate(0, y, 0)
 
 
-def extruded_polygon(a, b, c, vertices, center, half_thickness):
-    """Exact signed polygon distance, extruded along its third coordinate."""
-    d = field_math.full_like(a, 1e4)
-    inside = field_math.zeros_like(a, dtype=bool)
-    for (ax, ay), (bx, by) in zip(vertices, vertices[1:] + vertices[:1], strict=True):
-        ex, ey = bx - ax, by - ay
-        t = field_math.clip(((a - ax) * ex + (b - ay) * ey) / (ex * ex + ey * ey), 0, 1)
-        d = min_(d, field_math.hypot(a - ax - t * ex, b - ay - t * ey))
-        cross = (ay > b) != (by > b)
-        xcross = ax + (b - ay) * ex / (ey if ey else 1)
-        inside = field_math.logical_xor(inside, cross & (a < xcross))
-    planar = field_math.where(inside, -d, d)
-    vertical = field_math.abs(c - center) - half_thickness
-    return field_math.hypot(max_(planar, 0), max_(vertical, 0)) + min_(max_(planar, vertical), 0)
-
-
-def loft(x, y, z, stations):
-    """Elliptical fuselage/nacelle sections with smoothly changing proportions."""
-    xp = field_math.array([s[0] for s in stations])
-    yc = field_math.interp(x, xp, field_math.array([s[1] for s in stations]))
-    zc = field_math.interp(x, xp, field_math.array([s[2] for s in stations]))
-    ry = field_math.interp(x, xp, field_math.array([s[3] for s in stations]))
-    rz = field_math.interp(x, xp, field_math.array([s[4] for s in stations]))
-    radial = (field_math.hypot((y - yc) / ry, (z - zc) / rz) - 1) * min_(ry, rz)
-    axial = max_(xp[0] - x, x - xp[-1])
-    return field_math.hypot(max_(radial, 0), max_(axial, 0)) + min_(max_(radial, axial), 0)
-
-
-def segment(x, y, z, a, b, radius):
-    vx, vy, vz = (b[i] - a[i] for i in range(3))
-    t = field_math.clip(
-        ((x - a[0]) * vx + (y - a[1]) * vy + (z - a[2]) * vz) / (vx * vx + vy * vy + vz * vz), 0, 1
-    )
-    return (
-        field_math.sqrt(
-            (x - a[0] - t * vx) ** 2 + (y - a[1] - t * vy) ** 2 + (z - a[2] - t * vz) ** 2
-        )
-        - radius
-    )
-
-
-def x_cylinder(x, y, z, cx, cy, cz, length, radius):
-    axial = field_math.abs(x - cx) - length / 2
-    radial = field_math.hypot(y - cy, z - cz) - radius
-    return field_math.hypot(max_(axial, 0), max_(radial, 0)) + min_(max_(axial, radial), 0)
+def ellipse_loft(stations):
+    return circle(1).loft(stations, axis="x")
 
 
 FUSELAGE = (
@@ -95,135 +35,13 @@ FUSELAGE = (
     (8.7, 0, 0.08, 0.12, 0.12),
     (9.45, 0, 0.06, 0.013, 0.016),
 )
-
-
-def fuselage(x, y, z):
-    d = loft(x, y, z, FUSELAGE)
-    material = field_math.where(x > 7.45, 5, 8)
-    return Hit(d, material)
-
-
 WING = ((2.0, 1.05), (1.15, 1.95), (-1.6, 6.65), (-2.55, 6.65), (-3.55, 3.25), (-4.55, 1.45))
 LEX = ((4.42, 0.55), (3.54, 0.83), (1.55, 2.17), (1.13, 2.03), (1.88, 1.01))
 FLAP = ((-2.95, 2.65), (-3.50, 3.25), (-2.55, 6.65), (-2.22, 6.55))
 TAILPLANE = ((-5.38, 0.75), (-6.65, 1.42), (-7.42, 3.55), (-8.18, 3.55), (-8.10, 0.75))
-
-
-def lifting_surfaces(x, y, z):
-    ay = field_math.abs(y)
-    # Anhedral, span taper and chordwise lens section form an actual airfoil.
-    wing_z = -0.04 - 0.034 * (ay - 1.4)
-    wing_t = max_(0.045, 0.225 - 0.028 * (ay - 1.4))
-    leading = field_math.interp(
-        ay, field_math.array((1.05, 1.95, 6.65)), field_math.array((2.0, 1.15, -1.6))
-    )
-    trailing = field_math.interp(
-        ay, field_math.array((1.45, 3.25, 6.65)), field_math.array((-4.55, -3.55, -2.55))
-    )
-    chord_fraction = (x - trailing) / max_(leading - trailing, 0.2)
-    wing_profile = field_math.sqrt(max_(0.012, 1 - (2 * chord_fraction - 1) ** 2))
-    main = extruded_polygon(x, ay, z, WING, wing_z, wing_t * wing_profile)
-    root_extension = extruded_polygon(
-        x, ay, z, LEX, 0.07, 0.095 * field_math.sqrt(max_(0.1, 1 - ((x - 2.7) / 1.8) ** 2))
-    )
-    flap = extruded_polygon(x, ay, z, FLAP, wing_z - 0.025, wing_t * 0.62 * wing_profile)
-    tail_z = 0.22 + 0.065 * (ay - 0.75)
-    tail_leading = -5.38 - 0.58 * (ay - 0.75)
-    tail_trailing = -8.10 - 0.025 * (ay - 0.75)
-    tail_fraction = (x - tail_trailing) / max_(tail_leading - tail_trailing, 0.2)
-    tail_profile = field_math.sqrt(max_(0.02, 1 - (2 * tail_fraction - 1) ** 2))
-    tail = extruded_polygon(
-        x, ay, z, TAILPLANE, tail_z, max_(0.032, 0.105 - 0.012 * ay) * tail_profile
-    )
-    return min_(min_(main, root_extension), min_(flap, tail))
-
-
 FIN = ((-5.65, 0.40), (-7.10, 2.72), (-8.10, 2.93), (-8.34, 2.72), (-7.75, 0.45))
 RUDDER = ((-7.77, 0.65), (-7.15, 2.57), (-8.10, 2.76), (-8.31, 2.61))
-
-
-def vertical_tails(x, y, z):
-    # Canted fins rise from the two engine shoulders.
-    fin_y = field_math.abs(y) - (1.09 + 0.23 * (z - 0.4))
-    taper = max_(0.045, 0.145 - 0.043 * (z - 0.4))
-    main = extruded_polygon(x, z, fin_y, FIN, 0, taper)
-    rudder = extruded_polygon(x, z, fin_y, RUDDER, 0.015, taper * 0.65)
-    return min_(main, rudder)
-
-
 VENTRAL_FIN = ((-6.10, -0.25), (-7.28, -1.32), (-8.13, -1.29), (-7.76, -0.31))
-
-
-def ventral_fins(x, y, z):
-    d = field_math.full_like(x, 1e4)
-    for side in (-1, 1):
-        d = min_(d, extruded_polygon(x, z, y, VENTRAL_FIN, side * 1.30, 0.085))
-    return d
-
-
-def engines(x, y, z):
-    d = field_math.full_like(x, 1e4)
-    for side in (-1, 1):
-        nacelle = loft(
-            x,
-            y,
-            z,
-            (
-                (-8.72, side * 1.04, -0.06, 0.47, 0.43),
-                (-7.6, side * 1.04, -0.05, 0.58, 0.53),
-                (-5.5, side * 1.04, -0.03, 0.64, 0.57),
-                (-3.0, side * 1.03, 0.03, 0.64, 0.55),
-                (-1.55, side * 1.03, 0.08, 0.55, 0.45),
-            ),
-        )
-        d = min_(d, nacelle)
-    return d
-
-
-def inlet_housings(x, y, z):
-    d = field_math.full_like(x, 1e4)
-    for side in (-1, 1):
-        # The front aperture is carved from this fairing in the model history.
-        fairing = rounded_box(x, y, z, -0.75, side * 1.55, -0.14, 1.42, 0.48, 0.43, 0.075)
-        chin = segment(x, y, z, (1.05, side * 1.12, -0.17), (-2.35, side * 1.55, -0.28), 0.19)
-        d = min_(d, min_(fairing, chin))
-    return d
-
-
-def inlet_cutters(x, y, z):
-    d = field_math.full_like(x, 1e4)
-    for side in (-1, 1):
-        d = min_(d, box(x, y, z, -0.12, side * 1.57, -0.16, 1.05, 0.33, 0.29))
-    return d
-
-
-def inlet_depth(x, y, z):
-    d = field_math.full_like(x, 1e4)
-    for side in (-1, 1):
-        d = min_(d, box(x, y, z, -0.62, side * 1.57, -0.16, 0.07, 0.32, 0.28))
-    return d
-
-
-def exhausts(x, y, z):
-    d = field_math.full_like(x, 1e4)
-    for side in (-1, 1):
-        yc = side * 1.04
-        # Concentric outer shroud, recessed black throat and inner turbine cone.
-        outer = x_cylinder(x, y, z, -8.73, yc, -0.06, 0.43, 0.45)
-        bore = x_cylinder(x, y, z, -8.88, yc, -0.06, 0.47, 0.325)
-        ring = max_(outer, -bore)
-        throat = x_cylinder(x, y, z, -8.77, yc, -0.06, 0.025, 0.318)
-        cone = loft(x, y, z, ((-9.01, yc, -0.06, 0.02, 0.02), (-8.74, yc, -0.06, 0.19, 0.19)))
-        d = min_(d, min_(ring, min_(throat, cone)))
-        # Faceted petals on the afterburner ring.
-        for k in range(12):
-            angle = 2 * field_math.pi * k / 12
-            py = yc + 0.43 * field_math.cos(angle)
-            pz = -0.06 + 0.43 * field_math.sin(angle)
-            d = min_(d, segment(x, y, z, (-8.96, py, pz), (-8.55, py, pz), 0.019))
-    return d
-
-
 CANOPY = (
     (1.50, 0, 0.80, 0.52, 0.12),
     (1.83, 0, 1.04, 0.69, 0.34),
@@ -234,164 +52,288 @@ CANOPY = (
 )
 
 
-def canopy(x, y, z):
-    glass = loft(x, y, z, CANOPY)
-    lower = 0.80 - z
-    return max_(glass, lower)
+def mirrored_polygon(points, side):
+    return polygon((x, side * y) for x, y in points)
 
 
-def canopy_frames(x, y, z):
-    shell = field_math.abs(loft(x, y, z, CANOPY)) - 0.022
-    lower = 0.79 - z
-    bands = min_(
-        field_math.abs(x - 1.75) - 0.045,
-        min_(field_math.abs(x - 3.02) - 0.026, field_math.abs(x - 5.07) - 0.035),
+def wing_height(x, y):
+    span = field_math.abs(y)
+    leading = field_math.interp(span, (1.05, 1.95, 6.65), (2.0, 1.15, -1.6))
+    trailing = field_math.interp(span, (1.45, 3.25, 6.65), (-4.55, -3.55, -2.55))
+    fraction = (x - trailing) / max_(leading - trailing, 0.2)
+    profile = field_math.sqrt(max_(0.012, 1 - (2 * fraction - 1) ** 2))
+    return 2 * max_(0.045, 0.225 - 0.028 * (span - 1.4)) * profile
+
+
+def wing_offset(x, y):
+    return -0.04 - 0.034 * (field_math.abs(y) - 1.4)
+
+
+def lex_height(x, y):
+    return 0.19 * field_math.sqrt(max_(0.1, 1 - ((x - 2.7) / 1.8) ** 2))
+
+
+def tail_height(x, y):
+    span = field_math.abs(y)
+    leading = -5.38 - 0.58 * (span - 0.75)
+    trailing = -8.10 - 0.025 * (span - 0.75)
+    fraction = (x - trailing) / max_(leading - trailing, 0.2)
+    profile = field_math.sqrt(max_(0.02, 1 - (2 * fraction - 1) ** 2))
+    return 2 * max_(0.032, 0.105 - 0.012 * span) * profile
+
+
+def tail_offset(x, y):
+    return 0.22 + 0.065 * (field_math.abs(y) - 0.75)
+
+
+def lifting_surfaces():
+    parts = []
+    for side in (-1, 1):
+        parts.append(
+            mirrored_polygon(WING, side).extrude(
+                wing_height, offset=wing_offset, bounds=((-4.6, -6.7, -0.5), (2.1, 6.7, 0.5))
+            )
+        )
+        parts.append(
+            mirrored_polygon(LEX, side).extrude(
+                lex_height, offset=0.07, bounds=((1.1, -2.2, -0.2), (4.5, 2.2, 0.3))
+            )
+        )
+        parts.append(
+            mirrored_polygon(FLAP, side).extrude(
+                lambda x, y: 0.62 * wing_height(x, y),
+                offset=wing_offset,
+                bounds=((-3.6, -6.7, -0.5), (-2.1, 6.7, 0.5)),
+            )
+        )
+        parts.append(
+            mirrored_polygon(TAILPLANE, side).extrude(
+                tail_height, offset=tail_offset, bounds=((-8.2, -3.6, -0.1), (-5.3, 3.6, 0.6))
+            )
+        )
+    return min_(*parts)
+
+
+def fin_height(x, z):
+    return 2 * max_(0.045, 0.145 - 0.043 * (z - 0.4))
+
+
+def vertical_tails():
+    fins = []
+    for side in (-1, 1):
+
+        def fin_offset(x, z, side=side):
+            return -side * (1.09 + 0.23 * (z - 0.4))
+
+        main = polygon(FIN).extrude(
+            fin_height, offset=fin_offset, bounds=((-8.4, 0.3, -2), (-5.6, 3, 2))
+        )
+        rudder = polygon(RUDDER).extrude(
+            lambda x, z: 0.65 * fin_height(x, z),
+            offset=lambda x, z, side=side: -side * (1.105 + 0.23 * (z - 0.4)),
+            bounds=((-8.4, 0.6, -2), (-7.1, 2.8, 2)),
+        )
+        fins.extend((main.rotate(math.pi / 2, "x"), rudder.rotate(math.pi / 2, "x")))
+    return min_(*fins)
+
+
+def engines():
+    return min_(
+        *(
+            ellipse_loft(
+                (
+                    (-8.72, side * 1.04, -0.06, 0.47, 0.43),
+                    (-7.6, side * 1.04, -0.05, 0.58, 0.53),
+                    (-5.5, side * 1.04, -0.03, 0.64, 0.57),
+                    (-3.0, side * 1.03, 0.03, 0.64, 0.55),
+                    (-1.55, side * 1.03, 0.08, 0.55, 0.45),
+                )
+            )
+            for side in (-1, 1)
+        )
     )
-    center = field_math.abs(y) - 0.018
-    return max_(max_(shell, lower), min_(bands, center))
 
 
-def wing_hardpoints(x, y, z):
-    d = field_math.full_like(x, 1e4)
+def inlet_housings():
+    return min_(
+        *(
+            block(-0.75, side * 1.55, -0.14, 1.42, 0.48, 0.43, 0.075)
+            | capsule((1.05, side * 1.12, -0.17), (-2.35, side * 1.55, -0.28), 0.19)
+            for side in (-1, 1)
+        )
+    )
+
+
+def exhausts():
+    parts = []
+    for side in (-1, 1):
+        yc = side * 1.04
+        outer = x_cylinder(-8.73, yc, -0.06, 0.43, 0.45)
+        bore = x_cylinder(-8.88, yc, -0.06, 0.47, 0.325)
+        throat = x_cylinder(-8.77, yc, -0.06, 0.025, 0.318)
+        cone = ellipse_loft(((-9.01, yc, -0.06, 0.02, 0.02), (-8.74, yc, -0.06, 0.19, 0.19)))
+        parts.extend((outer - bore, throat, cone))
+        for index in range(12):
+            angle = 2 * math.pi * index / 12
+            py = yc + 0.43 * math.cos(angle)
+            pz = -0.06 + 0.43 * math.sin(angle)
+            parts.append(capsule((-8.96, py, pz), (-8.55, py, pz), 0.019))
+    return min_(*parts)
+
+
+def canopy_frames(glass):
+    bands = min_(
+        block(1.75, 0, 1.2, 0.045, 1, 1),
+        block(3.02, 0, 1.2, 0.026, 1, 1),
+        block(5.07, 0, 1.2, 0.035, 1, 1),
+    )
+    center = block(3.5, 0, 1.2, 3, 0.018, 1)
+    return glass.shell(0.044) & block(3.5, 0, 2.29, 3, 1, 1.5) & (bands | center)
+
+
+def wing_hardpoints():
+    pylons = []
+    for side in (-1, 1):
+        for station_y in (2.75, 4.75):
+            cx = -0.88 - 0.52 * (station_y - 2.75)
+            pylons.append(
+                xz_polygon(
+                    (
+                        (cx - 0.55, -0.29),
+                        (cx + 0.38, -0.29),
+                        (cx + 0.17, -0.72),
+                        (cx - 0.27, -0.72),
+                    ),
+                    0.11,
+                    side * station_y,
+                )
+            )
+    return min_(*pylons)
+
+
+def weapons():
+    stores = []
     for side in (-1, 1):
         for station_y in (2.75, 4.75):
             cx = -0.88 - 0.52 * (station_y - 2.75)
             cy = side * station_y
-            pylon = extruded_polygon(
-                x,
-                z,
-                y,
-                ((cx - 0.55, -0.29), (cx + 0.38, -0.29), (cx + 0.17, -0.72), (cx - 0.27, -0.72)),
-                cy,
-                0.055,
+            stores.append(x_cylinder(cx, cy, -0.79, 3.10, 0.125))
+            stores.append(
+                ellipse_loft(
+                    (
+                        (cx + 1.54, cy, -0.79, 0.125, 0.125),
+                        (cx + 2.18, cy, -0.79, 0.004, 0.004),
+                    )
+                )
             )
-            d = min_(d, pylon)
-    return d
-
-
-def weapons(x, y, z):
-    d = field_math.full_like(x, 1e4)
-    for side in (-1, 1):
-        for station_y in (2.75, 4.75):
-            cx = -0.88 - 0.52 * (station_y - 2.75)
-            cy = side * station_y
-            body = x_cylinder(x, y, z, cx, cy, -0.79, 3.10, 0.125)
-            nose = loft(
-                x,
-                y,
-                z,
-                ((cx + 1.54, cy, -0.79, 0.125, 0.125), (cx + 2.18, cy, -0.79, 0.004, 0.004)),
-            )
-            aft = field_math.full_like(x, 1e4)
             for offset in (-1, 1):
-                aft = min_(
-                    aft,
-                    extruded_polygon(
-                        x,
-                        y,
-                        z,
+                stores.append(
+                    polygon(
                         (
                             (cx - 1.62, cy + offset * 0.10),
                             (cx - 1.05, cy + offset * 0.10),
                             (cx - 1.42, cy + offset * 0.43),
-                        ),
-                        -0.79,
-                        0.018,
-                    ),
+                        )
+                    ).extrude(0.036, offset=-0.79)
                 )
-            d = min_(d, min_(body, min_(nose, aft)))
-    # Wingtip missile rails and their smaller short-range rounds.
-    for side in (-1, 1):
         cy = side * 6.57
-        rail = box(x, y, z, -2.10, cy, -0.26, 1.42, 0.065, 0.07)
-        round_body = x_cylinder(x, y, z, -2.18, cy, -0.38, 2.35, 0.085)
-        tip = loft(x, y, z, ((-0.99, cy, -0.38, 0.085, 0.085), (-0.52, cy, -0.38, 0.004, 0.004)))
-        d = min_(d, min_(rail, min_(round_body, tip)))
-    return d
-
-
-def surface_detail(x, y, z):
-    d = field_math.full_like(x, 1e4)
-    for side in (-1, 1):
-        # Wing panel seams, hinge line, formation light and fin rudder hinge.
-        traces = (
-            ((0.35, side * 2.03, 0.168), (-2.44, side * 5.82, 0.005), 0.013),
-            ((-3.04, side * 2.63, 0.12), (-2.45, side * 6.41, -0.005), 0.012),
-            ((-7.77, side * 1.40, 0.75), (-7.54, side * 1.62, 2.58), 0.014),
-            ((-5.88, side * 1.53, 0.30), (-7.55, side * 3.29, 0.39), 0.011),
+        stores.extend(
+            (
+                block(-2.10, cy, -0.26, 1.42, 0.065, 0.07),
+                x_cylinder(-2.18, cy, -0.38, 2.35, 0.085),
+                ellipse_loft(((-0.99, cy, -0.38, 0.085, 0.085), (-0.52, cy, -0.38, 0.004, 0.004))),
+            )
         )
-        for a, b, radius in traces:
-            d = min_(d, segment(x, y, z, a, b, radius))
-        light = box(x, y, z, -2.30, side * 6.65, -0.18, 0.13, 0.033, 0.028)
-        d = min_(d, light)
-    # Dorsal refuelling spine and a small pitot probe.
-    d = min_(d, segment(x, y, z, (-1.25, 0, 0.99), (1.25, 0, 0.96), 0.035))
-    d = min_(d, segment(x, y, z, (9.35, 0, 0.06), (9.90, 0, 0.06), 0.016))
-    return d
+    return min_(*stores)
 
 
-def sensors_and_antennas(x, y, z):
-    # Forward electro-optical fairing and dorsal blade aerials.
-    pod = field_math.sqrt(((x - 5.58) / 0.42) ** 2 + (y / 0.25) ** 2 + ((z + 0.42) / 0.17) ** 2) - 1
-    pod = pod * 0.17
-    d = pod
+def surface_detail():
+    details = []
+    for side in (-1, 1):
+        details.extend(
+            capsule(a, b, radius)
+            for a, b, radius in (
+                ((0.35, side * 2.03, 0.168), (-2.44, side * 5.82, 0.005), 0.013),
+                ((-3.04, side * 2.63, 0.12), (-2.45, side * 6.41, -0.005), 0.012),
+                ((-7.77, side * 1.40, 0.75), (-7.54, side * 1.62, 2.58), 0.014),
+                ((-5.88, side * 1.53, 0.30), (-7.55, side * 3.29, 0.39), 0.011),
+            )
+        )
+        details.append(block(-2.30, side * 6.65, -0.18, 0.13, 0.033, 0.028))
+    details.extend(
+        (
+            capsule((-1.25, 0, 0.99), (1.25, 0, 0.96), 0.035),
+            capsule((9.35, 0, 0.06), (9.90, 0, 0.06), 0.016),
+        )
+    )
+    return min_(*details)
+
+
+def sensors_and_antennas():
+    parts = [sphere(1).transform(Transform.scaling(0.42, 0.25, 0.17)).translate(5.58, 0, -0.42)]
     for px, height in ((0.65, 0.35), (-2.25, 0.29), (-4.92, 0.24)):
-        blade = extruded_polygon(
-            x, z, y, ((px - 0.16, 0.88), (px + 0.06, 0.88), (px - 0.05, 0.88 + height)), 0, 0.015
+        parts.append(
+            xz_polygon(((px - 0.16, 0.88), (px + 0.06, 0.88), (px - 0.05, 0.88 + height)), 0.03)
         )
-        d = min_(d, blade)
     for side in (-1, 1):
-        # Shoulder formation lights sit flush above the inlet fairings.
-        d = min_(d, box(x, y, z, -1.18, side * 1.91, 0.17, 0.29, 0.015, 0.012))
-    return d
+        parts.append(block(-1.18, side * 1.91, 0.17, 0.29, 0.015, 0.012))
+    return min_(*parts)
 
 
-def rescue_markings(x, y, z):
-    d = field_math.full_like(x, 1e4)
-    for side in (-1, 1):
-        # Small service triangles on the upper wing near the inboard pylon.
-        mark = extruded_polygon(
-            x,
-            y,
-            z,
-            ((-0.72, side * 3.02), (-0.91, side * 3.32), (-1.08, side * 3.04)),
-            0.083,
-            0.014,
+def rescue_markings():
+    return min_(
+        *(
+            mirrored_polygon(((-0.72, 3.02), (-0.91, 3.32), (-1.08, 3.04)), side).extrude(
+                0.028, offset=0.083
+            )
+            for side in (-1, 1)
         )
-        d = min_(d, mark)
-    return d
+    )
 
 
 MODEL = Model()
-MODEL.start("lofted_fuselage", custom_sdf(fuselage))
-MODEL.define("swept_wings_and_tailplanes", custom_sdf(lifting_surfaces, material_id=8))
-MODEL.apply("lifting_surfaces_attached", "min", "swept_wings_and_tailplanes")
-MODEL.define("canted_vertical_tails", custom_sdf(vertical_tails, material_id=8))
-MODEL.apply("tails_attached", "min", "canted_vertical_tails")
-MODEL.define("ventral_stability_fins", custom_sdf(ventral_fins, material_id=8))
-MODEL.apply("ventral_fins_attached", "min", "ventral_stability_fins")
-MODEL.define("twin_engine_nacelles", custom_sdf(engines, material_id=8))
-MODEL.apply("engines_attached", "min", "twin_engine_nacelles")
-MODEL.define("intake_fairings", custom_sdf(inlet_housings, material_id=8))
-MODEL.apply("intake_housings_attached", "min", "intake_fairings")
-MODEL.define("intake_duct_cutters", custom_sdf(inlet_cutters))
+airframe = MODEL.material("airframe", base_color="#929a9d", metallic=0.72, roughness=0.43)
+radome = MODEL.material("radome", base_color="#292e32", metallic=0.08, roughness=0.72)
+glass_id = MODEL.material("canopy", base_color="#263e4a", metallic=0.15, roughness=0.11)
+engine_id = MODEL.material("engine", base_color="#353839", metallic=0.75, roughness=0.62)
+missile = MODEL.material("missile", base_color="#dedbd2", metallic=0.26, roughness=0.40)
+marking = MODEL.material("marking", base_color="#a84237", metallic=0.10, roughness=0.58)
+
+
+def attach(name, shape, material):
+    MODEL.define(name, shape.with_material(material))
+    MODEL.apply(name + "_attached", "min", name)
+
+
+fuselage = ellipse_loft(FUSELAGE)
+MODEL.start("lofted_fuselage", fuselage.with_material(airframe))
+attach("radome", fuselage & block(8.95, 0, 0, 1.5, 2, 2), radome)
+attach("swept_wings_and_tailplanes", lifting_surfaces(), airframe)
+attach("canted_vertical_tails", vertical_tails(), airframe)
+attach(
+    "ventral_stability_fins",
+    min_(*(xz_polygon(VENTRAL_FIN, 0.17, side * 1.30) for side in (-1, 1))),
+    airframe,
+)
+attach("twin_engine_nacelles", engines(), airframe)
+attach("intake_fairings", inlet_housings(), airframe)
+MODEL.define(
+    "intake_duct_cutters",
+    min_(*(block(-0.12, side * 1.57, -0.16, 1.05, 0.33, 0.29) for side in (-1, 1))),
+)
 MODEL.apply("open_intake_ducts", "subtract", "intake_duct_cutters")
-MODEL.define("shadowed_intake_depth", custom_sdf(inlet_depth, material_id=5))
-MODEL.apply("intake_depth_attached", "min", "shadowed_intake_depth")
-MODEL.define("afterburner_nozzles", custom_sdf(exhausts, material_id=4))
-MODEL.apply("nozzles_attached", "min", "afterburner_nozzles")
-MODEL.define("smoked_canopy", custom_sdf(canopy, material_id=6))
-MODEL.apply("canopy_attached", "min", "smoked_canopy")
-MODEL.define("canopy_structural_frames", custom_sdf(canopy_frames, material_id=5))
-MODEL.apply("frames_attached", "min", "canopy_structural_frames")
-MODEL.define("underwing_pylons", custom_sdf(wing_hardpoints, material_id=8))
-MODEL.apply("pylons_attached", "min", "underwing_pylons")
-MODEL.define("wing_stores_and_tip_rails", custom_sdf(weapons, material_id=0))
-MODEL.apply("stores_attached", "min", "wing_stores_and_tip_rails")
-MODEL.define("engraved_seams_and_details", custom_sdf(surface_detail, material_id=5))
-MODEL.apply("detailed_airframe", "min", "engraved_seams_and_details")
-MODEL.define("sensors_antennae_and_lights", custom_sdf(sensors_and_antennas, material_id=5))
-MODEL.apply("flight_hardware_attached", "min", "sensors_antennae_and_lights")
-MODEL.define("rescue_and_service_markings", custom_sdf(rescue_markings, material_id=7))
-MODEL.apply("painted_markings_attached", "min", "rescue_and_service_markings")
+attach(
+    "shadowed_intake_depth",
+    min_(*(block(-0.62, side * 1.57, -0.16, 0.07, 0.32, 0.28) for side in (-1, 1))),
+    radome,
+)
+attach("afterburner_nozzles", exhausts(), engine_id)
+glass = ellipse_loft(CANOPY)
+attach("smoked_canopy", glass & block(3.5, 0, 2.30, 3, 1, 1.5), glass_id)
+attach("canopy_structural_frames", canopy_frames(glass), radome)
+attach("underwing_pylons", wing_hardpoints(), airframe)
+attach("wing_stores_and_tip_rails", weapons(), missile)
+attach("engraved_seams_and_details", surface_detail(), radome)
+attach("sensors_antennae_and_lights", sensors_and_antennas(), radome)
+attach("rescue_and_service_markings", rescue_markings(), marking)
 SCENE = MODEL.scene()
