@@ -2,7 +2,19 @@
 
 import math
 
-from sdf_kernel import Model, Transform, box, capsule, circle, cylinder, max_, min_, polygon, sphere
+from sdf_kernel import (
+    Model,
+    Plane,
+    Transform,
+    box,
+    capsule,
+    circle,
+    cylinder,
+    max_,
+    min_,
+    polygon,
+    sphere,
+)
 from sdf_kernel import math as field_math
 
 
@@ -15,7 +27,7 @@ def x_cylinder(x, y, z, length, radius):
 
 
 def xz_polygon(points, thickness, y=0):
-    return polygon(points).extrude(thickness).rotate(math.pi / 2, "x").translate(0, y, 0)
+    return polygon(points).on(Plane.xz(y=y)).extrude(thickness)
 
 
 def ellipse_loft(stations):
@@ -91,12 +103,19 @@ def lifting_surfaces():
     for side in (-1, 1):
         parts.append(
             mirrored_polygon(WING, side).extrude(
-                wing_height, offset=wing_offset, bounds=((-4.6, -6.7, -0.5), (2.1, 6.7, 0.5))
+                wing_height,
+                offset=wing_offset,
+                bounds=((-4.6, -6.7, -0.5), (2.1, 6.7, 0.5)),
+                height_lipschitz=128,
+                offset_lipschitz=0.034,
             )
         )
         parts.append(
             mirrored_polygon(LEX, side).extrude(
-                lex_height, offset=0.07, bounds=((1.1, -2.2, -0.2), (4.5, 2.2, 0.3))
+                lex_height,
+                offset=0.07,
+                bounds=((1.1, -2.2, -0.2), (4.5, 2.2, 0.3)),
+                height_lipschitz=1,
             )
         )
         parts.append(
@@ -104,11 +123,17 @@ def lifting_surfaces():
                 lambda x, y: 0.62 * wing_height(x, y),
                 offset=wing_offset,
                 bounds=((-3.6, -6.7, -0.5), (-2.1, 6.7, 0.5)),
+                height_lipschitz=80,
+                offset_lipschitz=0.034,
             )
         )
         parts.append(
             mirrored_polygon(TAILPLANE, side).extrude(
-                tail_height, offset=tail_offset, bounds=((-8.2, -3.6, -0.1), (-5.3, 3.6, 0.6))
+                tail_height,
+                offset=tail_offset,
+                bounds=((-8.2, -3.6, -0.1), (-5.3, 3.6, 0.6)),
+                height_lipschitz=8,
+                offset_lipschitz=0.065,
             )
         )
     return min_(*parts)
@@ -125,15 +150,29 @@ def vertical_tails():
         def fin_offset(x, z, side=side):
             return -side * (1.09 + 0.23 * (z - 0.4))
 
-        main = polygon(FIN).extrude(
-            fin_height, offset=fin_offset, bounds=((-8.4, 0.3, -2), (-5.6, 3, 2))
+        main = (
+            polygon(FIN)
+            .on(Plane.xz())
+            .extrude(
+                fin_height,
+                offset=fin_offset,
+                bounds=((-8.4, 0.3, -2), (-5.6, 3, 2)),
+                height_lipschitz=0.1,
+                offset_lipschitz=0.23,
+            )
         )
-        rudder = polygon(RUDDER).extrude(
-            lambda x, z: 0.65 * fin_height(x, z),
-            offset=lambda x, z, side=side: -side * (1.105 + 0.23 * (z - 0.4)),
-            bounds=((-8.4, 0.6, -2), (-7.1, 2.8, 2)),
+        rudder = (
+            polygon(RUDDER)
+            .on(Plane.xz())
+            .extrude(
+                lambda x, z: 0.65 * fin_height(x, z),
+                offset=lambda x, z, side=side: -side * (1.105 + 0.23 * (z - 0.4)),
+                bounds=((-8.4, 0.6, -2), (-7.1, 2.8, 2)),
+                height_lipschitz=0.1,
+                offset_lipschitz=0.23,
+            )
         )
-        fins.extend((main.rotate(math.pi / 2, "x"), rudder.rotate(math.pi / 2, "x")))
+        fins.extend((main, rudder))
     return min_(*fins)
 
 

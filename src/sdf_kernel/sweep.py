@@ -7,7 +7,9 @@ from math import isfinite, sqrt
 
 import numpy as np
 
-from .dsl import Curve, Shape, _point
+from .curves import Curve
+from .dsl import Shape, _point
+from .shape_payloads import Sweep
 
 
 def _dot(a, b):
@@ -133,14 +135,14 @@ def sweep(profile: Shape, curve: Curve, *, tolerance=0.01, up=None, closed=False
         raise ValueError("sweep curve needs more than 8192 spans")
     points = tuple(points)
     frames = _frames(points, up, closed)
-    return Shape("profile_sweep", 3, (points, frames, tolerance, closed), (profile,))
+    return Shape("profile_sweep", 3, Sweep(points, frames, tolerance, closed), (profile,))
 
 
 def evaluate_sweep(node, q, evaluate):
     """Evaluate the union of mitered swept spans for a NumPy point array."""
-    points, frames = node.data[:2]
-    tolerance = node.data[2]
-    closed = node.data[3]
+    points, frames = node.data.points, node.data.frames
+    tolerance = node.data.tolerance
+    closed = node.data.closed
     start_normals, end_normals = _miters(frames, closed)
     origins = np.asarray(points[:-1])
     basis_u = np.asarray([frame[0] for frame in frames])
@@ -175,9 +177,9 @@ def sweep_bounds(node, level, analytic):
     """Conservative bounds for the sweep evaluator's sublevel set."""
     from .bounds import AABB
 
-    points, frames = node.data[:2]
-    tolerance = node.data[2]
-    closed = node.data[3]
+    points, frames = node.data.points, node.data.frames
+    tolerance = node.data.tolerance
+    closed = node.data.closed
     start_normals, end_normals = _miters(frames, closed)
     padding = max(0.0, level)
     profile_box = analytic(node.children[0], padding)

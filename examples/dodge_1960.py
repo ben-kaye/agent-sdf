@@ -2,7 +2,7 @@
 
 import math
 
-from sdf_kernel import Model, box, capsule, cylinder, min_, polygon, rectangle, torus
+from sdf_kernel import Model, Plane, box, capsule, cylinder, min_, polygon, rectangle, torus
 
 WHEELBASE = 2.9718  # 117 in
 AXLES = (-WHEELBASE / 2, WHEELBASE / 2)
@@ -40,7 +40,7 @@ def block(x, y, z, hx, hy, hz, radius=0):
 
 
 def xz_profile(points, depth, y=0):
-    return polygon(points).extrude(depth).rotate(math.pi / 2, "x").translate(0, y, 0)
+    return polygon(points).on(Plane.xz(y=y)).extrude(depth)
 
 
 def y_cylinder(x, y, z, radius, half_depth):

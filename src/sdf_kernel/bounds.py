@@ -118,23 +118,30 @@ def _analytic(shape, level=0.0):
     child = shape.children[0] if shape.children else None
     padding = max(0.0, level)
     if kind in ("sphere", "circle"):
-        return _centered((data[0] + padding,) * dim)
+        return _centered((data.radius + padding,) * dim)
     if kind in ("box", "rectangle"):
-        return _centered(tuple(x / 2 + padding for x in data[:dim]))
+        return _centered(
+            tuple(
+                x / 2 + padding
+                for x in (
+                    (data.width, data.height) if dim == 2 else (data.width, data.depth, data.height)
+                )
+            )
+        )
     if kind == "cylinder":
-        return _centered((data[0] + padding, data[0] + padding, data[1] / 2 + padding))
+        return _centered((data.radius + padding, data.radius + padding, data.height / 2 + padding))
     if kind == "torus":
-        major, tube = data
+        major, tube = data.major_radius, data.tube_radius
         return _centered((major + tube + padding, major + tube + padding, tube + padding))
     if kind == "capsule":
-        return _points_bounds(data[:2]).expanded(data[2] + padding)
+        return _points_bounds((data.start, data.end)).expanded(data.radius + padding)
     if kind == "tube":
-        return _points_bounds(data[0]).expanded(data[1] + padding)
+        return _points_bounds(data.points).expanded(data.radius + padding)
     if kind == "polygon":
-        return _points_bounds(data[0]).expanded(padding)
+        return _points_bounds(data.vertices).expanded(padding)
     if kind == "curve_profile":
         result = _empty(dim)
-        for segment in data[0]:
+        for segment in data.segments:
             if segment.kind == "arc":
                 center, start, _ = segment.points
                 radius = hypot(*(a - b for a, b in zip(start, center, strict=True)))
@@ -143,38 +150,64 @@ def _analytic(shape, level=0.0):
                 box = _points_bounds(segment.points)
             result = result.union(box)
         return result.expanded(padding)
-    if kind in ("custom", "python"):
-        if level <= 0 and len(data) > 2 and data[2] is not None:
-            return data[2]
+    if kind == "custom":
+        if level <= 0 and data.bounds is not None:
+            return data.bounds
         return _unknown(dim)
     if kind in ("min", "max", "subtract", "smooth_union"):
-        threshold = level + (data[0] / 4 if kind == "smooth_union" else 0)
+        threshold = level + (data.radius / 4 if kind == "smooth_union" else 0)
         a = _analytic(child, threshold)
         if kind == "subtract":
             return a
         b = _analytic(shape.children[1], threshold)
         return a.intersection(b) if kind == "max" else a.union(b)
     if kind == "offset":
-        return _analytic(child, level + data[0])
+        return _analytic(child, level + data.amount)
     if kind == "shell":
-        return _empty(dim) if level < -data[0] / 2 else _analytic(child, level + data[0] / 2)
-    if kind == "material":
+        return (
+            _empty(dim)
+            if level < -data.thickness / 2
+            else _analytic(child, level + data.thickness / 2)
+        )
+    if kind in ("material", "feature"):
         return _analytic(child, level)
     if kind == "translate":
         box = _analytic(child, level)
         return AABB(
-            tuple(a + b for a, b in zip(box.minimum, data, strict=True)),
-            tuple(a + b for a, b in zip(box.maximum, data, strict=True)),
+            tuple(a + b for a, b in zip(box.minimum, data.offset, strict=True)),
+            tuple(a + b for a, b in zip(box.maximum, data.offset, strict=True)),
         )
-    if kind == "scale":
-        box = _analytic(child, level / data[0])
+    if kind == "linear_pattern":
+        box = _analytic(child, level)
+        if box.is_empty:
+            return box
+        displacement = tuple((data.count - 1) * value for value in data.step)
         return AABB(
-            tuple(x * data[0] for x in box.minimum), tuple(x * data[0] for x in box.maximum)
+            tuple(a + min(0.0, d) for a, d in zip(box.minimum, displacement, strict=True)),
+            tuple(b + max(0.0, d) for b, d in zip(box.maximum, displacement, strict=True)),
+        )
+    if kind == "radial_pattern":
+        box = _analytic(child, level)
+        if box.is_empty or data.count == 1:
+            return box
+        a, b = {"x": (1, 2), "y": (2, 0), "z": (0, 1)}[data.axis]
+        radius = hypot(
+            max(abs(box.minimum[a]), abs(box.maximum[a])),
+            max(abs(box.minimum[b]), abs(box.maximum[b])),
+        )
+        low, high = list(box.minimum), list(box.maximum)
+        low[a] = low[b] = -radius
+        high[a] = high[b] = radius
+        return AABB(low, high)
+    if kind == "scale":
+        box = _analytic(child, level / data.factor)
+        return AABB(
+            tuple(x * data.factor for x in box.minimum), tuple(x * data.factor for x in box.maximum)
         )
     if kind == "rotate":
-        return _affine(_analytic(child, level), _rotation(dim, *data), (0.0,) * dim)
+        return _affine(_analytic(child, level), _rotation(dim, data.angle, data.axis), (0.0,) * dim)
     if kind == "transform":
-        transform = data[0]
+        transform = data.transform
         if transform.forward_affine is None:
             return _unknown(dim)
         return _affine(
@@ -192,10 +225,10 @@ def _analytic(shape, level=0.0):
         box = _analytic(child, level)
         if box.is_empty:
             return _empty(dim)
-        offset = data[1] if len(data) > 1 else 0.0
+        offset = data.offset
         return AABB(
-            (*box.minimum, offset - data[0] / 2 - padding),
-            (*box.maximum, offset + data[0] / 2 + padding),
+            (*box.minimum, offset - data.height / 2 - padding),
+            (*box.maximum, offset + data.height / 2 + padding),
         )
     if kind == "revolve":
         box = _analytic(child, level)

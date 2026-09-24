@@ -7,12 +7,10 @@ import base64
 import io
 import json
 import os
-import runpy
 import shutil
-import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from math import isfinite
+from math import isfinite, sqrt
 from pathlib import Path
 
 import numpy as np
@@ -20,9 +18,12 @@ from PIL import Image
 from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import sync_playwright
 
-from .dsl import Model, Shape
+from .bvh import _union_components
+from .dsl import Shape, min_
 from .glsl import compile_glsl
 from .materials import material_arrays, scene_materials
+from .model import Model
+from .scene_loader import load_scene
 from .smaa import smaa
 from .transform import _vector3
 
@@ -81,7 +82,25 @@ def _fxaa(image):
     return np.where(edge[..., None], blended, rgb).astype(np.uint8)
 
 
-def _config(scene, materials, eye, target, fov, camera_size, far, final):
+def _orientation(value):
+    try:
+        result = tuple(float(component) for component in value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("orientation must be four finite numbers (w, x, y, z)") from exc
+    if len(result) != 4 or not all(isfinite(component) for component in result):
+        raise ValueError("orientation must be four finite numbers (w, x, y, z)")
+    length = sqrt(sum(component * component for component in result))
+    if length < 1e-8:
+        raise ValueError("orientation must be a nonzero quaternion")
+    return tuple(component / length for component in result)
+
+
+def _orientation_up(orientation):
+    w, x, y, z = orientation
+    return (2 * (x * y - w * z), 1 - 2 * (x * x + z * z), 2 * (y * z + w * x))
+
+
+def _scene_bounds(scene):
     bounds = None
     try:
         box = scene.bounds()
@@ -89,18 +108,24 @@ def _config(scene, materials, eye, target, fov, camera_size, far, final):
             bounds = (box.minimum, box.maximum)
     except ValueError:
         pass
+    return bounds
+
+
+def _config(scene, materials, eye, target, fov, camera_size, far, final, up, orientation):
     palette, metallic, roughness, opacity = material_arrays(materials)
     return {
         "name": "render",
         "materials": materials,
         "eye": eye,
         "target": target,
+        "up": up,
+        "orientation": orientation,
         "fov": fov,
         "cameraSize": camera_size,
         "far": far,
         "autoFar": False,
         "final": final,
-        "bounds": bounds,
+        "bounds": _scene_bounds(scene),
         "palette": palette.tolist(),
         "metallic": metallic.tolist(),
         "roughness": roughness.tolist(),
@@ -147,8 +172,15 @@ def _render_webgl(shader, config, width, height):
                     page = browser.new_page(viewport={"width": width, "height": height})
                     page.goto(f"http://127.0.0.1:{server.server_port}/?embed", wait_until="load")
                     page.wait_for_function(
-                        "() => !document.querySelector('#status').classList.contains('busy')",
-                        timeout=90000,
+                        """([width, height]) => {
+                          const status = document.querySelector('#status');
+                          const canvas = document.querySelector('#image');
+                          return status.classList.contains('error') ||
+                            (canvas.dataset.renderComplete !== undefined &&
+                             canvas.width === width && canvas.height === height);
+                        }""",
+                        arg=[width, height],
+                        timeout=300000,
                     )
                     if "error" in (page.locator("#status").get_attribute("class") or ""):
                         raise ValueError(page.locator("#status-text").inner_text())
@@ -160,7 +192,7 @@ def _render_webgl(shader, config, width, height):
                         raise ValueError(
                             f"headless WebGL returned {image.size}, expected {(width, height)}"
                         )
-                    return image.convert("RGB")
+                    return image.convert("RGBA" if config.get("captureMode") == 1 else "RGB")
                 finally:
                     browser.close()
         except PlaywrightError as exc:
@@ -169,6 +201,53 @@ def _render_webgl(shader, config, width, height):
         server.shutdown()
         server.server_close()
         thread.join()
+
+
+def _node_count(scene):
+    seen = set()
+    pending = [scene]
+    while pending:
+        node = pending.pop()
+        if id(node) not in seen:
+            seen.add(id(node))
+            pending.extend(node.children)
+    return len(seen)
+
+
+def _render_chunked(scene, config, width, height):
+    components = _union_components(scene)
+    if len(components) < 2:
+        return _render_webgl(compile_glsl(scene), config, width, height)
+    layers = []
+    depths = []
+    start = 0
+    while start < len(components):
+        end = min(start + 100, len(components))
+        part = min_(*components[start:end])
+        while _node_count(part) > 900 and end > start + 1:
+            end = start + (end - start) // 2
+            part = min_(*components[start:end])
+        shader = compile_glsl(part)
+        part_config = {**config, "bounds": _scene_bounds(part)}
+        color = _render_webgl(shader, {**part_config, "captureMode": 1}, width, height)
+        depth = _render_webgl(shader, {**part_config, "captureMode": 2}, width, height)
+        layers.append(np.asarray(color, dtype=np.uint8))
+        rgb = np.asarray(depth, dtype=np.uint32)
+        depths.append(rgb[:, :, 0] * 65536 + rgb[:, :, 1] * 256 + rgb[:, :, 2])
+        start = end
+
+    order = np.argsort(np.stack(depths), axis=0)
+    colors = np.stack(layers)
+    sky = (np.arange(height, dtype=np.float32) + 0.5) / height
+    background = np.array((244, 244, 240), dtype=np.float32) - sky[:, None] * np.array(
+        (24, 21, 16), dtype=np.float32
+    )
+    composed = np.broadcast_to(background[:, None, :], (height, width, 3)).copy()
+    for index in range(len(layers) - 1, -1, -1):
+        selected = np.take_along_axis(colors, order[index][None, :, :, None], axis=0)[0]
+        alpha = selected[:, :, 3:4].astype(np.float32) / 255
+        composed = selected[:, :, :3].astype(np.float32) * alpha + composed * (1 - alpha)
+    return Image.fromarray(np.rint(composed).astype(np.uint8), "RGB")
 
 
 def render(
@@ -185,6 +264,8 @@ def render(
     final=False,
     aa="auto",
     bvh=False,
+    up=None,
+    orientation=None,
 ):
     """Render a scene with the same GLSL program used by the browser viewer."""
     if isinstance(scene, Model):
@@ -201,21 +282,36 @@ def render(
     if fov != 0 and not 1 <= fov <= 120:
         raise ValueError("fov must be zero or between 1 and 120 degrees")
     eye, target = _vector3(eye, "eye"), _vector3(target, "target")
+    if up is not None:
+        up = _vector3(up, "up")
+    if orientation is not None:
+        orientation = _orientation(orientation)
+        orientation_up = _orientation_up(orientation)
+        if up is not None and sum(a * b for a, b in zip(up, orientation_up, strict=True)) <= 0:
+            raise ValueError("up and orientation must point to the same camera hemisphere")
     if not all(isfinite(v) for v in (fov, far, camera_size)):
         raise ValueError("camera values must be finite")
     if sum((a - b) ** 2 for a, b in zip(eye, target, strict=True)) < 1e-8:
         raise ValueError("eye and target must be distinct 3D points")
+    if up is not None:
+        forward = tuple(b - a for a, b in zip(eye, target, strict=True))
+        cross = (
+            forward[1] * up[2] - forward[2] * up[1],
+            forward[2] * up[0] - forward[0] * up[2],
+            forward[0] * up[1] - forward[1] * up[0],
+        )
+        if sum(component * component for component in cross) < 1e-16:
+            raise ValueError("up must not be parallel to the viewing direction")
     if far <= 0 or camera_size <= 0:
         raise ValueError("far and camera size must be positive")
     mode = ("ssaa" if final else "none") if aa == "auto" else aa
     scale = 2 if mode in ("ssaa", "adaptive") else 1
-    shader = compile_glsl(scene, bvh=bvh)
-    image = _render_webgl(
-        shader,
-        _config(scene, materials, tuple(eye), tuple(target), fov, camera_size, far, final),
-        width * scale,
-        height * scale,
-    )
+    config = _config(scene, materials, eye, target, fov, camera_size, far, final, up, orientation)
+    if _node_count(scene) > 1000:
+        image = _render_chunked(scene, config, width * scale, height * scale)
+    else:
+        shader = compile_glsl(scene, bvh=bvh)
+        image = _render_webgl(shader, config, width * scale, height * scale)
     if scale > 1:
         image = image.resize((width, height), Image.Resampling.LANCZOS)
     elif mode == "smaa":
@@ -233,6 +329,8 @@ def main():
     parser.add_argument("--height", type=int, default=192)
     parser.add_argument("--eye", nargs=3, type=float, default=(4, -6, 3))
     parser.add_argument("--target", nargs=3, type=float, default=(0, 0, 0))
+    parser.add_argument("--up", nargs=3, type=float, help="camera up vector")
+    parser.add_argument("--orientation", nargs=4, type=float, help="camera quaternion (w x y z)")
     parser.add_argument("--fov", type=float, default=40)
     parser.add_argument("--camera-size", type=float, default=2.0)
     parser.add_argument("--far", type=float, default=20)
@@ -242,26 +340,10 @@ def main():
         "--aa", choices=("auto", "none", "fxaa", "smaa", "ssaa", "adaptive"), default="auto"
     )
     args = parser.parse_args()
-    source = Path(args.source).resolve()
-    if not source.is_file():
-        parser.error(f"source file does not exist: {source}")
-    sys.path.insert(0, str(source.parent))
     try:
-        namespace = runpy.run_path(str(source))
-    finally:
-        sys.path.pop(0)
-    scene = namespace.get("SCENE")
-    model = namespace.get("MODEL")
-    if scene is None and isinstance(model, Model):
-        scene = model.scene()
-    if not isinstance(scene, Shape) or scene.dim != 3:
-        parser.error(f"{source} must define a 3D SCENE or MODEL")
-    try:
-        materials = scene_materials(
-            model if isinstance(model, Model) else None, namespace.get("MATERIALS")
-        )
+        loaded = load_scene(args.source)
         image = render(
-            scene,
+            loaded.scene,
             args.width,
             args.height,
             args.eye,
@@ -269,10 +351,12 @@ def main():
             args.fov,
             args.far,
             camera_size=args.camera_size,
-            materials=materials,
+            materials=loaded.materials,
             final=args.final,
             aa=args.aa,
             bvh=args.bvh,
+            up=args.up,
+            orientation=args.orientation,
         )
     except ValueError as exc:
         parser.error(str(exc))
@@ -280,9 +364,11 @@ def main():
     output.parent.mkdir(parents=True, exist_ok=True)
     image.save(output)
     metadata = {
-        "source": str(source),
+        "source": str(loaded.source),
         "eye": args.eye,
         "target": args.target,
+        "up": args.up,
+        "orientation": args.orientation,
         "fov": args.fov,
         "projection": "orthographic" if args.fov == 0 else "perspective",
         "camera_size": args.camera_size,
@@ -292,10 +378,10 @@ def main():
         "bvh": args.bvh,
         "aa": ("ssaa" if args.final else "none") if args.aa == "auto" else args.aa,
     }
-    if isinstance(model, Model):
-        metadata["features"] = model.history()
-    if materials:
-        metadata["materials"] = materials
+    if loaded.model is not None:
+        metadata["features"] = loaded.model.history()
+    if loaded.materials:
+        metadata["materials"] = loaded.materials
     output.with_suffix(".json").write_text(json.dumps(metadata, indent=2) + "\n")
     print(f"Wrote {output} and camera metadata")
 

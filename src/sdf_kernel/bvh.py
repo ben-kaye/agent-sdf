@@ -27,7 +27,7 @@ def _union_components(shape: Shape) -> list[Shape]:
     """Flatten unions through affine and material wrappers, preserving other CSG."""
     from .dsl import Shape
 
-    distributive = {"translate", "rotate", "scale", "transform", "material"}
+    distributive = {"translate", "rotate", "scale", "transform", "material", "feature"}
     components = []
     pending = [(shape, ())]
     while pending:
@@ -51,7 +51,15 @@ def _certified_box(shape: Shape):
     """
     if shape.kind in {"sphere", "box", "cylinder", "torus", "capsule", "tube"}:
         pass
-    elif shape.kind in {"translate", "rotate", "scale", "material"}:
+    elif shape.kind in {
+        "translate",
+        "rotate",
+        "scale",
+        "linear_pattern",
+        "radial_pattern",
+        "material",
+        "feature",
+    }:
         if _certified_box(shape.children[0]) is None:
             return None
     else:

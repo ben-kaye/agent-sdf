@@ -47,10 +47,28 @@
                     border: 1px solid #ffffff24; border-radius: inherit; }
     .hint { position: absolute; left: 14px; bottom: 14px; padding: 6px 9px;
             border-radius: 5px; color: #293039; background: #ffffffe8; font-size: 12px; }
+    .pick-panel { position: absolute; top: 14px; right: 14px; width: min(300px, calc(100% - 28px));
+                  padding: 11px 13px; border: 1px solid #ffffff55; border-radius: 8px;
+                  background: #1b2229ed; color: #eef2f5; box-shadow: 0 8px 28px #0006;
+                  pointer-events: none; font-size: 12px; }
+    .pick-panel[hidden] { display: none; }
+    .pick-panel strong { display: block; margin-bottom: 6px; font-size: 13px; }
+    .pick-panel dl { display: grid; grid-template-columns: 75px 1fr; gap: 3px 8px; margin: 0; }
+    .pick-panel dt { color: #a9b5c0; }
+    .pick-panel dd { margin: 0; overflow-wrap: anywhere; font-family: ui-monospace, SFMono-Regular, monospace; }
+    .pick-measure { margin-top: 8px; padding-top: 8px; border-top: 1px solid #ffffff35; }
     .status { display: inline-flex; align-items: center; gap: 7px; }
     .dot { width: 7px; height: 7px; border-radius: 50%; background: #75c58a; }
     .busy .dot { background: #e9bd69; }
     .error .dot { background: #ef7979; }
+    .error-details { position: fixed; z-index: 4; right: 16px; bottom: 48px;
+                     max-width: min(720px, calc(100vw - 32px)); }
+    .error-details summary { padding: 7px 10px; border: 1px solid #a95e5e; border-radius: 6px;
+                             background: #38282b; color: #ffd5d5; }
+    .error-details pre { max-height: min(50vh, 420px); overflow: auto; margin: 4px 0 0;
+                         padding: 12px; border: 1px solid #a95e5e; border-radius: 6px;
+                         background: #231b1d; color: #ffd5d5; font: 12px/1.4 ui-monospace, monospace;
+                         white-space: pre-wrap; overflow-wrap: anywhere; }
     .fps { min-width: 58px; color: #d3e7f5; font-variant-numeric: tabular-nums; }
     .camera { font-family: ui-monospace, SFMono-Regular, monospace; }
     .embed header, .embed footer { display: none; }
@@ -103,14 +121,16 @@
       </div>
     </header>
     <main class="stage-wrap">
-      <div class="stage" id="stage" tabindex="0" aria-label="3D model viewer. Left drag to orbit, right drag to pan, scroll to zoom.">
+      <div class="stage" id="stage" tabindex="0" aria-label="3D model viewer. Click a surface to inspect it, click another to measure distance. Left drag to orbit, right drag to pan, scroll to zoom.">
         <canvas id="image" aria-label="GPU rendered 3D model"></canvas>
-        <div class="hint" id="hint">Left drag to orbit · Right drag to pan · Scroll to zoom</div>
+        <div class="hint" id="hint">Click to inspect · Click twice to measure · Drag to orbit</div>
+        <div class="pick-panel" id="pick-panel" aria-live="polite" hidden></div>
       </div>
     </main>
     <footer>
       <span class="status busy" id="status"><span class="dot"></span><span id="status-text">Loading scene…</span></span>
       <span id="metrics"></span><span class="fps" id="fps" title="Render updates per second while interacting">FPS idle</span><span class="grow"></span><span class="camera" id="camera"></span>
+      <details id="error-details" class="error-details" hidden><summary>View error details</summary><pre id="error-message"></pre></details>
     </footer>
   </div>
   <script>
@@ -128,17 +148,19 @@
     const stage = $('stage');
     const image = $('image');
     let initial, camera, previousFov = 40;
-    const refinementScales = [0.4, 0.65, 0.85, 1];
+    const refinementScales = [0.2, 0.35, 0.55, 0.8, 1];
     let drag = null, settledTimer = null, frameRequest = null, refinementStep = 3, renderRevision = 0;
     let canvasIntersecting = false;
     let frameTimes = [], fpsIdleTimer = null;
-    let gl, program, uniforms, ready = false, sceneSource, configData;
-    let timerExtension, gpuQuery = null;
+    let gl, program, uniforms, vertexArray, vertexBuffer, materialTexture;
+    let ready = false, sceneSource, configData, appliedRevision = 0, reloadError = '';
+    let pickedPoints = [], pickRequest = 0;
+    let renderFence = null, renderStarted = 0, renderFenceRevision = 0;
     let compileMs = 0;
     const vertexSource = `#version 300 es
+    layout(location = 0) in vec2 aPosition;
     void main() {
-      vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));
-      gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+      gl_Position = vec4(aPosition, 0.0, 1.0);
     }`;
     const fragmentBody = `
     uniform vec2 uResolution;
@@ -150,6 +172,7 @@
     uniform int uMaterialCount;
     uniform bool uHasMaterials;
     uniform bool uFinal;
+    uniform int uCaptureMode;
     out vec4 outColor;
     void main() {
       vec3 forward = normalize(uTarget - uEye);
@@ -164,6 +187,8 @@
       vec3 ray = ortho ? forward : normalize(forward + displacement);
       float sky = 1.0 - gl_FragCoord.y / uResolution.y;
       vec3 background = (vec3(244,244,240) - vec3(24,21,16) * sky) / 255.0;
+      vec4 miss = uCaptureMode == 2 ? vec4(1.0) :
+        (uCaptureMode == 1 ? vec4(0.0) : vec4(background, 1.0));
       float near = 0.0, far = uFar;
       if (uHasBounds) {
         float padding = max(0.01, 0.0001 * length(uBoundsMax - uBoundsMin));
@@ -172,7 +197,7 @@
         for (int axis = 0; axis < 3; axis++) {
           if (abs(ray[axis]) < 1e-7) {
             if (origin[axis] < lo[axis] || origin[axis] > hi[axis]) {
-              outColor = vec4(background, 1); return;
+              outColor = miss; return;
             }
           } else {
             float a = (lo[axis] - origin[axis]) / ray[axis];
@@ -181,7 +206,7 @@
             far = min(far, max(a, b));
           }
         }
-        if (far < near) { outColor = vec4(background, 1); return; }
+        if (far < near) { outColor = miss; return; }
       }
       float travel = near;
       vec3 composed = vec3(0);
@@ -189,20 +214,31 @@
       bool escaping = false;
       int layers = 0;
       for (int i = 0; i < 256; i++) {
-        vec2 hit = mapScene(origin + travel * ray);
+        vec3 samplePoint = origin + travel * ray;
+        vec3 hit = mapScene(samplePoint);
         if (isnan(hit.x) || isinf(hit.x)) break;
         if (escaping) {
-          travel += max(abs(hit.x) * 0.75, 0.002);
+          travel += max(abs(mapStep(samplePoint, ray)) * 0.75, 0.002);
           escaping = hit.x < 0.004;
           if (travel > far) break;
           continue;
         }
         if (hit.x >= 0.001) {
-          travel += max(hit.x * 0.75, 0.0005);
+          float safeStep = mapStep(samplePoint, ray);
+          if (isnan(safeStep) || isinf(safeStep) || safeStep <= 0.0) break;
+          float nextTravel = travel + safeStep;
+          if (nextTravel <= travel) break;
+          travel = nextTravel;
           if (travel > far) break;
           continue;
         }
         vec3 p = origin + travel * ray;
+        if (uCaptureMode == 2) {
+          float packed = floor(clamp(travel / uFar, 0.0, 1.0) * 16777214.0 + 0.5);
+          outColor = vec4(vec3(floor(packed / 65536.0),
+            floor(mod(packed, 65536.0) / 256.0), mod(packed, 256.0)) / 255.0, 1.0);
+          return;
+        }
         vec2 e = vec2(0.002, 0);
         vec3 gradient = vec3(
           mapScene(p+e.xyy).x-mapScene(p-e.xyy).x,
@@ -225,9 +261,12 @@
           ambient = clamp(1.0 - 0.7 * occlusion, 0.45, 1.0);
           float shadowTravel = 0.02;
           for (int j = 0; j < 24; j++) {
-            float shadowDistance = mapScene(p + normal * 0.01 + light * shadowTravel).x;
+            vec3 shadowPoint = p + normal * 0.01 + light * shadowTravel;
+            float shadowDistance = mapScene(shadowPoint).x;
             visibility = min(visibility, clamp(10.0 * shadowDistance / shadowTravel, 0.0, 1.0));
-            shadowTravel += max(shadowDistance * 0.75, 0.025);
+            float shadowStep = mapStep(shadowPoint, light);
+            if (shadowStep <= 0.0) break;
+            shadowTravel += shadowStep;
             if (shadowTravel > uFar || visibility < 0.02) break;
           }
         }
@@ -250,7 +289,9 @@
         travel += 0.002;
         escaping = true;
       }
-      outColor = vec4(composed + transmission * background, 1);
+      float alpha = 1.0 - transmission;
+      outColor = uCaptureMode == 1 ? vec4(composed / max(alpha, 1e-6), alpha) :
+        (uCaptureMode == 2 ? miss : vec4(composed + transmission * background, 1.0));
     }`;
 
     function compileShader(type, source) {
@@ -259,49 +300,68 @@
       gl.compileShader(shader);
       return shader;
     }
-    async function initGL() {
-      ready = false;
-      gl = image.getContext('webgl2', { alpha: false, antialias: false, preserveDrawingBuffer: true });
+    async function initGL(nextConfig, nextSource) {
+      gl = image.getContext('webgl2', { alpha: true, premultipliedAlpha: false,
+        antialias: false, preserveDrawingBuffer: true });
       if (!gl) throw new Error('WebGL2 is unavailable. Enable browser graphics acceleration.');
       status('Compiling scene on GPU…', 'busy');
       const started = performance.now();
       const parallel = gl.getExtension('KHR_parallel_shader_compile');
-      timerExtension = gl.getExtension('EXT_disjoint_timer_query_webgl2');
       const vert = compileShader(gl.VERTEX_SHADER, vertexSource);
       const frag = compileShader(gl.FRAGMENT_SHADER,
-        '#version 300 es\nprecision highp float;\nprecision highp int;\n' + sceneSource + fragmentBody);
-      program = gl.createProgram();
-      gl.attachShader(program, vert); gl.attachShader(program, frag); gl.linkProgram(program);
-      if (parallel) {
-        while (!gl.getProgramParameter(program, parallel.COMPLETION_STATUS_KHR)) {
-          if (gl.isContextLost()) throw new Error('Graphics context lost while compiling. Reload to retry.');
-          await new Promise(resolve => setTimeout(resolve, 50));
+        '#version 300 es\nprecision highp float;\nprecision highp int;\n' + nextSource + fragmentBody);
+      const nextProgram = gl.createProgram();
+      try {
+        gl.attachShader(nextProgram, vert); gl.attachShader(nextProgram, frag); gl.linkProgram(nextProgram);
+        if (parallel) {
+          while (!gl.getProgramParameter(nextProgram, parallel.COMPLETION_STATUS_KHR)) {
+            if (gl.isContextLost()) throw new Error('Graphics context lost while compiling. Reload to retry.');
+            await new Promise(resolve => setTimeout(resolve, 50));
+          }
         }
+        if (!gl.getProgramParameter(nextProgram, gl.LINK_STATUS)) {
+          const message = gl.getShaderInfoLog(frag) || gl.getShaderInfoLog(vert) ||
+            gl.getProgramInfoLog(nextProgram);
+          throw new Error('GLSL compilation failed: ' + message);
+        }
+      } catch (error) {
+        gl.deleteProgram(nextProgram);
+        throw error;
+      } finally {
+        gl.deleteShader(vert); gl.deleteShader(frag);
       }
-      if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
-        const message = gl.getShaderInfoLog(frag) || gl.getShaderInfoLog(vert) || gl.getProgramInfoLog(program);
-        gl.deleteShader(vert); gl.deleteShader(frag); gl.deleteProgram(program);
-        throw new Error('GLSL compilation failed: ' + message);
-      }
-      gl.deleteShader(vert); gl.deleteShader(frag);
+      if (renderFence) { gl.deleteSync(renderFence); renderFence = null; }
+      pauseRendering();
+      renderRevision++;
+      const oldProgram = program, oldTexture = materialTexture;
+      program = nextProgram;
       gl.useProgram(program);
-      gl.bindVertexArray(gl.createVertexArray());
-      uniforms = Object.fromEntries(['Resolution','Eye','Target','Up','Fov','CameraSize','Far','BoundsMin','BoundsMax','HasBounds','Materials','MaterialCount','HasMaterials','Final']
-        .map(name => [name, gl.getUniformLocation(program, 'u' + name)]));
-      gl.uniform1i(uniforms.HasBounds, !!configData.bounds);
-      if (configData.bounds) {
-        gl.uniform3fv(uniforms.BoundsMin, configData.bounds[0]);
-        gl.uniform3fv(uniforms.BoundsMax, configData.bounds[1]);
+      if (!vertexArray) {
+        vertexArray = gl.createVertexArray();
+        vertexBuffer = gl.createBuffer();
       }
-      const count = configData.palette.length;
+      gl.bindVertexArray(vertexArray);
+      gl.bindBuffer(gl.ARRAY_BUFFER, vertexBuffer);
+      gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+      gl.enableVertexAttribArray(0);
+      gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+      uniforms = Object.fromEntries(['Resolution','Eye','Target','Up','Fov','CameraSize','Far','BoundsMin','BoundsMax','HasBounds','Materials','MaterialCount','HasMaterials','Final','CaptureMode']
+        .map(name => [name, gl.getUniformLocation(program, 'u' + name)]));
+      gl.uniform1i(uniforms.HasBounds, !!nextConfig.bounds);
+      if (nextConfig.bounds) {
+        gl.uniform3fv(uniforms.BoundsMin, nextConfig.bounds[0]);
+        gl.uniform3fv(uniforms.BoundsMax, nextConfig.bounds[1]);
+      }
+      const count = nextConfig.palette.length;
       const pixels = new Float32Array(count * 8);
-      configData.palette.forEach((color, i) => {
-        pixels.set([...color.map(v => v / 255), configData.metallic[i]], i * 4);
-        pixels[count * 4 + i * 4] = configData.roughness[i];
-        pixels[count * 4 + i * 4 + 1] = configData.opacity[i];
+      nextConfig.palette.forEach((color, i) => {
+        pixels.set([...color.map(v => v / 255), nextConfig.metallic[i]], i * 4);
+        pixels[count * 4 + i * 4] = nextConfig.roughness[i];
+        pixels[count * 4 + i * 4 + 1] = nextConfig.opacity[i];
       });
       gl.activeTexture(gl.TEXTURE0);
-      gl.bindTexture(gl.TEXTURE_2D, gl.createTexture());
+      materialTexture = gl.createTexture();
+      gl.bindTexture(gl.TEXTURE_2D, materialTexture);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
@@ -309,22 +369,50 @@
       gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, count, 2, 0, gl.RGBA, gl.FLOAT, pixels);
       gl.uniform1i(uniforms.Materials, 0);
       gl.uniform1i(uniforms.MaterialCount, count);
-      gl.uniform1i(uniforms.HasMaterials, Object.keys(configData.materials).length > 0);
-      gl.uniform1i(uniforms.Final, !!configData.final);
+      gl.uniform1i(uniforms.HasMaterials, Object.keys(nextConfig.materials).length > 0);
+      gl.uniform1i(uniforms.Final, !!nextConfig.final);
+      gl.uniform1i(uniforms.CaptureMode, nextConfig.captureMode || 0);
+      if (oldProgram) gl.deleteProgram(oldProgram);
+      if (oldTexture) gl.deleteTexture(oldTexture);
+      configData = nextConfig;
+      sceneSource = nextSource;
+      initial = { ...nextConfig, orientation: nextConfig.orientation || initialOrientation(nextConfig) };
+      if (!camera) {
+        camera = structuredClone(initial);
+        previousFov = camera.fov || 40;
+      }
+      document.title = `${nextConfig.name} · GLSL Viewer`;
+      $('name').textContent = nextConfig.name;
+      showMaterials(nextConfig.materials);
       compileMs = performance.now() - started;
       ready = true;
+      clearReloadError();
       queueRender(document.body.classList.contains('embed'));
     }
-    function pollGpu() {
-      if (!gpuQuery || !ready) return;
-      if (!gl.getQueryParameter(gpuQuery.query, gl.QUERY_RESULT_AVAILABLE)) {
-        setTimeout(pollGpu, 100); return;
+    function pollRender() {
+      if (!renderFence || !ready) return;
+      const result = gl.clientWaitSync(renderFence, 0, 0);
+      if (result === gl.TIMEOUT_EXPIRED) { setTimeout(pollRender, 50); return; }
+      gl.deleteSync(renderFence);
+      renderFence = null;
+      if (result === gl.WAIT_FAILED) { status('GPU render failed', 'error'); return; }
+      const elapsed = performance.now() - renderStarted;
+      $('metrics').textContent = `${image.width} × ${image.height} · Render ${elapsed.toFixed(0)} ms`;
+      if (!isCanvasVisible()) return;
+      if (renderFenceRevision !== renderRevision) { scheduleDraw(); return; }
+      image.dataset.renderComplete = String(renderRevision);
+      if (refinementStep === refinementScales.length - 1) return;
+      const next = refinementScales[refinementStep + 1] / refinementScales[refinementStep];
+      if (elapsed * next * next > 1200) {
+        status('Preview resolution limited by render time');
+        return;
       }
-      if (!gl.getParameter(timerExtension.GPU_DISJOINT_EXT)) {
-        const ms = gl.getQueryParameter(gpuQuery.query, gl.QUERY_RESULT) / 1e6;
-        $('metrics').textContent = `${gpuQuery.width} × ${gpuQuery.height} · GPU ${ms.toFixed(1)} ms`;
-      }
-      gl.deleteQuery(gpuQuery.query); gpuQuery = null;
+      const revision = renderRevision;
+      settledTimer = setTimeout(() => {
+        if (revision !== renderRevision) return;
+        refinementStep++;
+        scheduleDraw();
+      }, 120);
     }
     function farDistance() {
       if (!configData.autoFar) return camera.far;
@@ -342,6 +430,7 @@
     }
     function draw() {
       if (!ready || !isCanvasVisible()) return;
+      delete image.dataset.renderComplete;
       const scale = Number($('resolution').value) / 100 * refinementScales[refinementStep];
       const width = Math.max(1, Math.min(4096, Math.round(stage.clientWidth * scale)));
       const height = Math.max(1, Math.round(width * stage.clientHeight / stage.clientWidth));
@@ -352,12 +441,13 @@
       gl.uniform3fv(uniforms.Up, rotateVector(camera.orientation, [0, 1, 0]));
       gl.uniform1f(uniforms.Fov, camera.fov); gl.uniform1f(uniforms.CameraSize, camera.cameraSize);
       gl.uniform1f(uniforms.Far, farDistance());
-      const measure = timerExtension && !gpuQuery;
-      if (measure) {
-        gpuQuery = { query: gl.createQuery(), width, height };
-        gl.beginQuery(timerExtension.TIME_ELAPSED_EXT, gpuQuery.query);
-      }
+      gl.disable(gl.SCISSOR_TEST);
       gl.drawArrays(gl.TRIANGLES, 0, 3);
+      renderFence = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
+      renderStarted = performance.now();
+      renderFenceRevision = renderRevision;
+      gl.flush();
+      setTimeout(pollRender, 50);
       const now = performance.now();
       frameTimes.push(now);
       while (frameTimes[0] < now - 2000) frameTimes.shift();
@@ -369,24 +459,25 @@
         frameTimes = [];
         $('fps').textContent = 'FPS idle';
       }, 2500);
-      if (measure) { gl.endQuery(timerExtension.TIME_ELAPSED_EXT); setTimeout(pollGpu, 100); }
-      if (!timerExtension) $('metrics').textContent = `${width} × ${height} · GPU timing unavailable`;
       status(`WebGL2 · GPU compile ${(compileMs / 1000).toFixed(2)} s`);
     }
     image.addEventListener('webglcontextlost', event => {
-      event.preventDefault(); ready = false; gpuQuery = null;
+      event.preventDefault(); ready = false; renderFence = null;
       pauseRendering(); renderRevision++;
       status('Graphics context lost. Waiting for recovery…', 'error');
     });
-    image.addEventListener('webglcontextrestored', () => initGL().catch(error => status(error.message, 'error')));
+    image.addEventListener('webglcontextrestored', () => {
+      program = null; vertexArray = null; vertexBuffer = null; materialTexture = null;
+      if (configData && sceneSource) initGL(configData, sceneSource).catch(error => showReloadError(error.message));
+    });
     new ResizeObserver(() => queueRender(document.body.classList.contains('embed'))).observe(stage);
     new IntersectionObserver(entries => {
       canvasIntersecting = entries[0].isIntersecting;
-      if (isCanvasVisible()) queueRender(true);
+      if (isCanvasVisible()) queueRender(document.body.classList.contains('embed'));
       else pauseRendering();
     }).observe(image);
     document.addEventListener('visibilitychange', () => {
-      if (isCanvasVisible()) queueRender(true);
+      if (isCanvasVisible()) queueRender(document.body.classList.contains('embed'));
       else pauseRendering();
     });
     $('resolution').oninput = () => {
@@ -396,8 +487,39 @@
     $('resolution').onchange = () => queueRender(true);
 
     function status(message, kind = '') {
+      if (reloadError && kind !== 'error') return;
       $('status').className = `status ${kind}`;
       $('status-text').textContent = message;
+    }
+    function showReloadError(message) {
+      reloadError = message || 'Unknown scene error';
+      $('error-message').textContent = reloadError;
+      $('error-details').hidden = false;
+      $('error-details').open = true;
+      status(ready ? 'Scene update failed · showing previous scene' : 'Scene unavailable', 'error');
+    }
+    function clearReloadError() {
+      reloadError = '';
+      $('error-details').hidden = true;
+      $('error-details').open = false;
+    }
+    function showMaterials(materials) {
+      const finishes = Object.entries(materials || {});
+      $('materials').hidden = !finishes.length;
+      $('finishes').replaceChildren();
+      for (const [name, finish] of finishes) {
+        const row = document.createElement('div');
+        row.className = 'finish';
+        const swatch = document.createElement('span');
+        swatch.className = 'swatch';
+        swatch.style.backgroundColor = finish.base_color;
+        const label = document.createElement('span');
+        label.textContent = name.replaceAll('_', ' ');
+        const values = document.createElement('small');
+        values.textContent = `M ${finish.metallic.toFixed(2)} · R ${finish.roughness.toFixed(2)} · O ${(finish.opacity ?? 1).toFixed(2)}`;
+        row.append(swatch, label, values);
+        $('finishes').append(row);
+      }
     }
     function vec(a, b) { return a.map((v, i) => v - b[i]); }
     function norm(v) { return Math.hypot(...v); }
@@ -415,7 +537,8 @@
     function initialOrientation(config) {
       const back = unit(vec(config.eye, config.target));
       const horizontal = Math.hypot(back[0], back[1]);
-      const right = horizontal > 1e-8 ? [-back[1] / horizontal, back[0] / horizontal, 0] : [1, 0, 0];
+      const right = config.up ? unit(cross(config.up, back)) :
+        horizontal > 1e-8 ? [-back[1] / horizontal, back[0] / horizontal, 0] : [1, 0, 0];
       const up = cross(back, right);
       const m00 = right[0], m01 = up[0], m02 = back[0];
       const m10 = right[1], m11 = up[1], m12 = back[1];
@@ -444,6 +567,75 @@
       $('fov').value = camera.fov || previousFov;
       $('fov-value').textContent = `${camera.fov || previousFov}°`;
     }
+    function pickRay(clientX, clientY) {
+      const rect = stage.getBoundingClientRect();
+      const x = 2 * (clientX - rect.left) / rect.width - 1;
+      const y = 1 - 2 * (clientY - rect.top) / rect.height;
+      const forward = unit(vec(camera.target, camera.eye));
+      const right = unit(cross(forward, rotateVector(camera.orientation, [0, 1, 0])));
+      const up = cross(right, forward);
+      const spread = camera.fov === 0 ? camera.cameraSize / 2 : Math.tan(camera.fov * Math.PI / 360);
+      const dx = x * spread * rect.width / rect.height;
+      const dy = y * spread;
+      const displacement = right.map((v, i) => dx * v + dy * up[i]);
+      return camera.fov === 0 ? {
+        origin: camera.eye.map((v, i) => v + displacement[i]), direction: forward
+      } : {
+        origin: camera.eye, direction: unit(forward.map((v, i) => v + displacement[i]))
+      };
+    }
+    function showPick(hit, message = '') {
+      const panel = $('pick-panel');
+      panel.hidden = false;
+      panel.replaceChildren();
+      const title = document.createElement('strong');
+      title.textContent = message || (hit ? 'Surface pick' : 'No surface at this point');
+      panel.append(title);
+      if (!hit) return;
+      const rows = [
+        ['Feature', hit.feature_name || 'Unnamed'],
+        ['Operation', hit.operation_name || '—'],
+        ['Material', hit.material_name || String(hit.material_id)],
+        ['Point', hit.point.map(x => x.toFixed(4)).join(', ')],
+        ['Normal', hit.normal.map(x => x.toFixed(4)).join(', ')],
+        ['Ray distance', hit.distance.toFixed(4)]
+      ];
+      if (hit.contributors?.length > 1) rows.push(['Contributors', hit.contributors.join(', ')]);
+      const details = document.createElement('dl');
+      for (const [label, value] of rows) {
+        const dt = document.createElement('dt'), dd = document.createElement('dd');
+        dt.textContent = label; dd.textContent = value; details.append(dt, dd);
+      }
+      panel.append(details);
+      if (pickedPoints.length === 2) {
+        const measurement = document.createElement('div');
+        measurement.className = 'pick-measure';
+        measurement.textContent = `Point distance: ${norm(vec(pickedPoints[1], pickedPoints[0])).toFixed(4)} scene units`;
+        panel.append(measurement);
+      }
+    }
+    async function pick(clientX, clientY) {
+      if (document.body.classList.contains('embed')) return;
+      const requestId = ++pickRequest;
+      const revision = appliedRevision;
+      const ray = pickRay(clientX, clientY);
+      showPick(null, 'Querying surface…');
+      try {
+        const response = await fetch('/pick', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ...ray, max_distance: farDistance(), revision })
+        });
+        const result = await response.json();
+        if (requestId !== pickRequest || revision !== appliedRevision) return;
+        if (!response.ok) throw new Error(result.error || `Pick failed: ${response.status}`);
+        if (!result.hit) { pickedPoints = []; showPick(null); return; }
+        pickedPoints.push(result.hit.point);
+        if (pickedPoints.length > 2) pickedPoints.shift();
+        showPick(result.hit);
+      } catch (error) {
+        if (requestId === pickRequest) showPick(null, error.message);
+      }
+    }
     function isCanvasVisible() {
       if (document.hidden || !canvasIntersecting) return false;
       const rect = image.getBoundingClientRect();
@@ -456,18 +648,11 @@
       frameRequest = null;
     }
     function scheduleDraw() {
-      if (frameRequest !== null || !isCanvasVisible()) return;
+      if (frameRequest !== null || renderFence || !isCanvasVisible()) return;
       frameRequest = requestAnimationFrame(() => {
         frameRequest = null;
         if (!isCanvasVisible()) { pauseRendering(); return; }
-        const revision = renderRevision;
         try { draw(); } catch (error) { status(error.message, 'error'); return; }
-        if (!ready || revision !== renderRevision || refinementStep === refinementScales.length - 1) return;
-        settledTimer = setTimeout(() => {
-          if (revision !== renderRevision) return;
-          refinementStep++;
-          scheduleDraw();
-        }, refinementStep === 0 ? 160 : 120);
       });
     }
     function queueRender(full = false) {
@@ -505,13 +690,15 @@
       event.preventDefault();
       stage.focus({ preventScroll: true });
       stage.setPointerCapture(event.pointerId);
-      drag = { x: event.clientX, y: event.clientY, pan: event.button === 2 || event.shiftKey };
+      drag = { x: event.clientX, y: event.clientY, startX: event.clientX, startY: event.clientY,
+        pointerId: event.pointerId, pan: event.button === 2 || event.shiftKey, moved: false };
       stage.classList.add('dragging');
     });
     stage.addEventListener('pointermove', event => {
       if (!drag || !camera) return;
       const dx = event.clientX - drag.x, dy = event.clientY - drag.y;
       drag.x = event.clientX; drag.y = event.clientY;
+      if (Math.hypot(event.clientX - drag.startX, event.clientY - drag.startY) > 4) drag.moved = true;
       if (!dx && !dy) return;
       if (drag.pan || event.shiftKey) pan(dx, dy); else orbit(dx, dy);
       queueRender();
@@ -521,7 +708,14 @@
       drag = null;
       stage.classList.remove('dragging');
     }
-    stage.addEventListener('pointerup', endDrag);
+    stage.addEventListener('pointerup', event => {
+      if (drag?.pointerId === event.pointerId && !drag.pan && !drag.moved) {
+        const rect = stage.getBoundingClientRect();
+        if (event.clientX >= rect.left && event.clientX <= rect.right &&
+            event.clientY >= rect.top && event.clientY <= rect.bottom) pick(event.clientX, event.clientY);
+      }
+      endDrag();
+    });
     stage.addEventListener('pointercancel', endDrag);
     stage.addEventListener('lostpointercapture', endDrag);
     stage.addEventListener('keydown', event => {
@@ -594,11 +788,12 @@
         status('Camera copied');
       } catch { status('Clipboard unavailable in this browser', 'error'); }
     };
-    async function fetchResource(path, json = false) {
+    async function fetchResource(path, json = false, allowMissing = false) {
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 15000);
       try {
         const response = await fetch(path, { signal: controller.signal });
+        if (allowMissing && response.status === 404) return null;
         if (!response.ok) throw new Error(`Could not load ${path}: ${response.status}`);
         return await (json ? response.json() : response.text());
       } catch (error) {
@@ -608,32 +803,44 @@
         clearTimeout(timeout);
       }
     }
-    Promise.all([fetchResource('config', true), fetchResource('scene.glsl')]).then(async ([config, shader]) => {
-      configData = config; sceneSource = shader;
-      initial = { ...config, orientation: initialOrientation(config) };
-      camera = structuredClone(initial);
-      previousFov = config.fov || 40;
-      document.title = `${config.name} · GLSL Viewer`;
-      $('name').textContent = config.name;
-      const finishes = Object.entries(config.materials || {});
-      if (finishes.length) {
-        $('materials').hidden = false;
-        for (const [name, finish] of finishes) {
-          const row = document.createElement('div');
-          row.className = 'finish';
-          const swatch = document.createElement('span');
-          swatch.className = 'swatch';
-          swatch.style.backgroundColor = finish.base_color;
-          const label = document.createElement('span');
-          label.textContent = name.replaceAll('_', ' ');
-          const values = document.createElement('small');
-          values.textContent = `M ${finish.metallic.toFixed(2)} · R ${finish.roughness.toFixed(2)} · O ${(finish.opacity ?? 1).toFixed(2)}`;
-          row.append(swatch, label, values);
-          $('finishes').append(row);
+    async function applySceneState(state) {
+      if (state.revision > appliedRevision && state.config && state.shader) {
+        try {
+          await initGL(state.config, state.shader);
+          appliedRevision = state.revision;
+          pickedPoints = [];
+          pickRequest++;
+          $('pick-panel').hidden = true;
+        } catch (error) {
+          if (!gl?.isContextLost()) appliedRevision = state.revision;
+          showReloadError(error.message);
         }
       }
-      await initGL();
-    }).catch(error => status(error.message || 'Could not load scene', 'error'));
+      if (state.error) showReloadError(state.error);
+      else if (state.compiling && !reloadError) status('Translating edited scene…', 'busy');
+    }
+    async function pollScene() {
+      try {
+        await applySceneState(await fetchResource('state', true));
+      } catch (error) {
+        showReloadError(error.message);
+      } finally {
+        setTimeout(pollScene, 700);
+      }
+    }
+    async function start() {
+      const state = await fetchResource('state', true, true);
+      if (state) {
+        await applySceneState(state);
+        setTimeout(pollScene, 700);
+      } else {
+        const [config, shader] = await Promise.all([
+          fetchResource('config', true), fetchResource('scene.glsl')
+        ]);
+        await initGL(config, shader);
+      }
+    }
+    start().catch(error => showReloadError(error.message || 'Could not load scene'));
   </script>
 </body>
 </html>

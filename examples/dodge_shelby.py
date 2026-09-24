@@ -2,7 +2,19 @@
 
 import math
 
-from sdf_kernel import Curve, Model, Shape, box, capsule, cylinder, min_, polygon, rectangle, torus
+from sdf_kernel import (
+    Curve,
+    Model,
+    Plane,
+    Shape,
+    box,
+    capsule,
+    cylinder,
+    min_,
+    polygon,
+    rectangle,
+    torus,
+)
 
 FRONT_AXLE = 1.25
 REAR_AXLE = FRONT_AXLE - 2.451
@@ -17,8 +29,8 @@ def block(x, y, z, sx, sy, sz, radius=0):
 
 
 def xz_profile(points, depth, y=0):
-    sketch = points if isinstance(points, Shape) else polygon(points)
-    return sketch.extrude(depth).rotate(math.pi / 2, "x").translate(0, y, 0)
+    profile = points if isinstance(points, Shape) else polygon(points)
+    return profile.on(Plane.xz(y=y)).extrude(depth)
 
 
 def curved_body_profile():
@@ -70,9 +82,14 @@ def side_panel(points, side, depth=0.018, protrusion=0):
     expanded = tuple((x, z / math.cos(angle)) for x, z in points)
     return (
         polygon(expanded)
+        .on(
+            Plane(
+                origin=(0, side * (1.14 + protrusion), 0),
+                normal=(0, -math.cos(angle), -math.sin(angle)),
+                x_direction=(1, 0, 0),
+            )
+        )
         .extrude(depth)
-        .rotate(math.pi / 2 + angle, "x")
-        .translate(0, side * (1.14 + protrusion), 0)
     )
 
 

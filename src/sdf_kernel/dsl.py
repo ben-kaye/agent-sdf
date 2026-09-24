@@ -4,12 +4,37 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from dataclasses import dataclass
-from math import atan2, cos, hypot, isfinite, pi, sin, sqrt
+from math import isfinite
 
 import numpy as np
 
 from .hit import Hit
-from .materials import PALETTE, finish, validate_material_id
+from .materials import validate_material_id
+from .plane import Plane, _cross
+from .shape_payloads import (
+    Box,
+    Capsule,
+    Custom,
+    Cylinder,
+    Empty,
+    Feature,
+    LinearPattern,
+    Material,
+    Offset,
+    Payload,
+    Polygon,
+    RadialPattern,
+    Radius,
+    Rectangle,
+    Rotation,
+    Scale,
+    Shell,
+    SmoothUnion,
+    Torus,
+    TransformPayload,
+    Translation,
+    validate_shape,
+)
 from .transform import Transform, _Pose, _vector_args
 
 
@@ -43,8 +68,11 @@ def _point(values: Iterable[float], dim: int) -> tuple[float, ...]:
 class Shape:
     kind: str
     dim: int
-    data: tuple = ()
+    data: Payload = Empty()
     children: tuple[Shape, ...] = ()
+
+    def __post_init__(self):
+        validate_shape(self.kind, self.dim, self.data, self.children)
 
     def sample(self, points):
         from .backend import evaluate_shape
@@ -88,27 +116,33 @@ class Shape:
     def __sub__(self, other: Shape) -> Shape:
         return _binary("subtract", self, other)
 
+    def __xor__(self, other: Shape) -> Shape:
+        _same_dim(self, other)
+        return (self - other) | (other - self)
+
     def smooth_union(self, other: Shape, radius: float) -> Shape:
         _same_dim(self, other)
-        return Shape("smooth_union", self.dim, (_positive(radius),), (self, other))
+        return Shape("smooth_union", self.dim, SmoothUnion(_positive(radius)), (self, other))
 
     def translate(self, *offset: float) -> Shape:
-        return Shape("translate", self.dim, _point(_vector_args(offset), self.dim), (self,))
+        return Shape(
+            "translate", self.dim, Translation(_point(_vector_args(offset), self.dim)), (self,)
+        )
 
     def rotate(self, angle: float, axis: str = "z") -> Shape:
         if self.dim == 2 and axis != "z":
             raise ValueError("2D sketches rotate around z")
         if self.dim == 3 and axis not in ("x", "y", "z"):
             raise ValueError("axis must be x, y, or z")
-        return Shape("rotate", self.dim, (_number(angle), axis), (self,))
+        return Shape("rotate", self.dim, Rotation(_number(angle), axis), (self,))
 
     def scale(self, factor: float) -> Shape:
-        return Shape("scale", self.dim, (_positive(factor),), (self,))
+        return Shape("scale", self.dim, Scale(_positive(factor)), (self,))
 
     def transform(self, transform: Transform) -> Shape:
         if not isinstance(transform, Transform) or transform.dim != self.dim:
             raise ValueError("shape and transform dimensions must match")
-        return Shape("transform", self.dim, (transform,), (self,))
+        return Shape("transform", self.dim, TransformPayload(transform), (self,))
 
     def place(
         self,
@@ -118,40 +152,67 @@ class Shape:
         axis_angle=None,
         quaternion=None,
         rpy=None,
-    ) -> Shape | PlacedProfile:
-        """Place geometry in 3D; rpy angles are applied as Rz @ Ry @ Rx."""
+    ) -> Shape:
+        """Place a 3D solid; rpy angles are applied as Rz @ Ry @ Rx."""
+        if self.dim != 3:
+            raise ValueError("place requires a 3D solid; use profile.on(plane) for a 2D sketch")
         pose = _Pose.from_components(
             translation, R=rotation_matrix, aa=axis_angle, q=quaternion, rpy=rpy
         )
-        if self.dim == 2:
-            return PlacedProfile(self, pose)
-        return Shape("transform", 3, (pose.as_transform(),), (self,))
+        return Shape("transform", 3, TransformPayload(pose.as_transform()), (self,))
+
+    def on(self, plane: Plane) -> Sketch:
+        """Place this 2D profile's (x, y) coordinates on a plane."""
+        return Sketch(self, plane)
 
     def offset(self, amount: float) -> Shape:
-        return Shape("offset", self.dim, (_number(amount),), (self,))
+        return Shape("offset", self.dim, Offset(_number(amount)), (self,))
 
     def shell(self, thickness: float) -> Shape:
         if self.dim != 3:
             raise ValueError("shell requires a 3D solid")
-        return Shape("shell", 3, (_positive(thickness),), (self,))
+        return Shape("shell", 3, Shell(_positive(thickness)), (self,))
 
     def linear_pattern(self, count: int, *step: float) -> Shape:
-        if not isinstance(count, int) or count < 1:
+        if not isinstance(count, int) or isinstance(count, bool) or count < 1:
             raise ValueError("pattern count must be a positive integer")
         delta = _point(_vector_args(step), self.dim)
-        return min_(*(self.translate(*(i * x for x in delta)) for i in range(count)))
+        return Shape("linear_pattern", self.dim, LinearPattern(count, delta), (self,))
 
     def radial_pattern(self, count: int, axis: str = "z") -> Shape:
-        if self.dim != 3 or not isinstance(count, int) or count < 1:
+        if self.dim != 3 or not isinstance(count, int) or isinstance(count, bool) or count < 1:
             raise ValueError("radial pattern requires a 3D solid and positive count")
-        return min_(*(self.rotate(2 * pi * i / count, axis) for i in range(count)))
+        return Shape("radial_pattern", 3, RadialPattern(count, axis), (self,))
 
     def with_material(self, material_id: int) -> Shape:
         if self.dim != 3:
             raise ValueError("with_material requires a 3D shape")
-        return Shape("material", 3, (validate_material_id(material_id),), (self,))
+        return Shape("material", 3, Material(validate_material_id(material_id)), (self,))
 
-    def extrude(self, height, *, offset=0.0, bounds=None) -> Shape:
+    def named(self, name: str) -> Shape:
+        """Name this field as one surface feature for geometry queries."""
+        if not isinstance(name, str) or not name.isidentifier():
+            raise ValueError("feature name must be a Python identifier")
+        return Shape("feature", self.dim, Feature(name), (self,))
+
+    def ray_cast(self, origin, direction, **kwargs):
+        from .query import ray_cast
+
+        return ray_cast(self, origin, direction, **kwargs)
+
+    def pick(self, x, y, width, height, **kwargs):
+        from .query import pick
+
+        return pick(self, x, y, width, height, **kwargs)
+
+    def section(self, origin, normal, bounds, **kwargs):
+        from .section import section
+
+        return section(self, origin, normal, bounds, **kwargs)
+
+    def extrude(
+        self, height, *, offset=0.0, bounds=None, height_lipschitz=None, offset_lipschitz=None
+    ) -> Shape:
         """Extrude along Z; constant height spans offset +/- height/2 (Z=0 by default).
 
         Height and offset may be symbolic functions of (x, y). Heights are full
@@ -163,7 +224,14 @@ class Shape:
             raise ValueError("only 2D sketches can be extruded")
         from .operations import extrude
 
-        return extrude(self, height, offset=offset, bounds=bounds)
+        return extrude(
+            self,
+            height,
+            offset=offset,
+            bounds=bounds,
+            height_lipschitz=height_lipschitz,
+            offset_lipschitz=offset_lipschitz,
+        )
 
     def loft(self, stations, *, axis="z") -> Shape:
         """Loft through (position, offset_u, offset_v, scale_u, scale_v).
@@ -184,55 +252,62 @@ class Shape:
 
         return sweep(self, curve, tolerance=tolerance, up=up, closed=closed)
 
-    def revolve(self) -> Shape:
-        if self.dim != 2:
-            raise ValueError("only 2D sketches can be revolved")
-        return Shape("revolve", 3, (), (self,))
+    def revolve(self, *, axis: str) -> Shape:
+        """Revolve around the profile's X or Y axis on the default XY plane."""
+        return self.on(Plane.xy()).revolve(axis=axis)
 
 
 @dataclass(frozen=True)
-class PlacedProfile:
+class Sketch:
     """A 2D profile embedded in a 3D plane, ready for a solid operation."""
 
     profile: Shape
-    pose: _Pose
-    post_transform: Transform | None = None
+    plane: Plane
 
-    def transform(self, transform: Transform) -> PlacedProfile:
-        if not isinstance(transform, Transform) or transform.dim != 3:
-            raise ValueError("placed profile and transform dimensions must match")
-        next_transform = (
-            transform if self.post_transform is None else self.post_transform.then(transform)
-        )
-        return PlacedProfile(self.profile, self.pose, next_transform)
+    def __post_init__(self):
+        if not isinstance(self.profile, Shape) or self.profile.dim != 2:
+            raise ValueError("sketch requires a 2D profile")
+        if not isinstance(self.plane, Plane):
+            raise ValueError("sketch requires a Plane")
 
-    def place(
-        self,
-        translation=None,
-        *,
-        rotation_matrix=None,
-        axis_angle=None,
-        quaternion=None,
-        rpy=None,
-    ) -> PlacedProfile:
-        next_pose = _Pose.from_components(
-            translation, R=rotation_matrix, aa=axis_angle, q=quaternion, rpy=rpy
-        )
-        if self.post_transform is not None:
-            return PlacedProfile(
-                self.profile, self.pose, self.post_transform.then(next_pose.as_transform())
+    def extrude(
+        self, height, *, offset=0.0, bounds=None, height_lipschitz=None, offset_lipschitz=None
+    ) -> Shape:
+        """Extrude along the plane normal, centered at offset +/- height/2.
+
+        Fields receive profile-local (x, y); bounds use (x, y, normal) coordinates.
+        """
+        return self.profile.extrude(
+            height,
+            offset=offset,
+            bounds=bounds,
+            height_lipschitz=height_lipschitz,
+            offset_lipschitz=offset_lipschitz,
+        ).transform(self.plane.as_transform())
+
+    def revolve(self, *, axis: str) -> Shape:
+        """Revolve around the plane's local X or Y axis through its origin."""
+        if axis not in ("x", "y"):
+            raise ValueError("revolution axis must be sketch-local x or y")
+        profile = self.profile
+        if axis == "x":
+            profile = profile.transform(
+                Transform(
+                    2,
+                    lambda p: p[::-1],
+                    forward_affine=(((0.0, 1.0), (1.0, 0.0)), (0.0, 0.0)),
+                )
             )
-        return PlacedProfile(self.profile, self.pose.then(next_pose))
-
-    def extrude(self, height, *, offset=0.0, bounds=None) -> Shape:
-        solid = self.profile.extrude(height, offset=offset, bounds=bounds).transform(
-            self.pose.as_transform()
+        profile = profile | profile.transform(Transform.scaling(-1, 1))
+        solid = Shape("revolve", 3, Empty(), (profile,))
+        radial, axial = (
+            (self.plane.y_direction, self.plane.x_direction)
+            if axis == "x"
+            else (self.plane.x_direction, self.plane.y_direction)
         )
-        return solid if self.post_transform is None else solid.transform(self.post_transform)
-
-    def revolve(self) -> Shape:
-        solid = self.profile.revolve().transform(self.pose.as_transform())
-        return solid if self.post_transform is None else solid.transform(self.post_transform)
+        tangent = _cross(axial, radial)
+        rotation = tuple((radial[i], tangent[i], axial[i]) for i in range(3))
+        return solid.transform(_Pose(self.plane.origin, rotation).as_transform())
 
 
 def _same_dim(a: Shape, b: Shape) -> None:
@@ -242,7 +317,7 @@ def _same_dim(a: Shape, b: Shape) -> None:
 
 def _binary(kind: str, a: Shape, b: Shape) -> Shape:
     _same_dim(a, b)
-    return Shape(kind, a.dim, (), (a, b))
+    return Shape(kind, a.dim, Empty(), (a, b))
 
 
 def _field_reduce(kind: str, fields):
@@ -297,21 +372,19 @@ def max_(*fields):
 
 
 def _custom_count(shape: Shape) -> int:
-    return (shape.kind in ("custom", "python")) + sum(
-        _custom_count(child) for child in shape.children
-    )
+    return (shape.kind == "custom") + sum(_custom_count(child) for child in shape.children)
 
 
 # Sketch primitives use the XY plane. Extrusion is centered on Z.
 def circle(radius: float) -> Shape:
-    return Shape("circle", 2, (_positive(radius),))
+    return Shape("circle", 2, Radius(_positive(radius)))
 
 
 def rectangle(width: float, height: float, corner_radius: float = 0) -> Shape:
     w, h, r = _positive(width), _positive(height), _number(corner_radius)
     if r < 0 or r > min(w, h) / 2:
         raise ValueError("corner radius must fit inside the rectangle")
-    return Shape("rectangle", 2, (w, h, r))
+    return Shape("rectangle", 2, Rectangle(w, h, r))
 
 
 def polygon(points: Iterable[Iterable[float]]) -> Shape:
@@ -322,7 +395,7 @@ def polygon(points: Iterable[Iterable[float]]) -> Shape:
         pts = pts[:-1]
     if any(pts[i] == pts[(i + 1) % len(pts)] for i in range(len(pts))):
         raise ValueError("polygon has a zero-length edge")
-    return Shape("polygon", 2, (pts,))
+    return Shape("polygon", 2, Polygon(pts))
 
 
 def loft(sections, *, axis="z") -> Shape:
@@ -334,30 +407,30 @@ def loft(sections, *, axis="z") -> Shape:
 
 # Solid primitives use Z as their main axis and are centered at the origin.
 def sphere(radius: float) -> Shape:
-    return Shape("sphere", 3, (_positive(radius),))
+    return Shape("sphere", 3, Radius(_positive(radius)))
 
 
 def box(width: float, depth: float, height: float, corner_radius: float = 0) -> Shape:
     w, d, h, r = _positive(width), _positive(depth), _positive(height), _number(corner_radius)
     if r < 0 or r > min(w, d, h) / 2:
         raise ValueError("corner radius must fit inside the box")
-    return Shape("box", 3, (w, d, h, r))
+    return Shape("box", 3, Box(w, d, h, r))
 
 
 def cylinder(radius: float, height: float) -> Shape:
-    return Shape("cylinder", 3, (_positive(radius), _positive(height)))
+    return Shape("cylinder", 3, Cylinder(_positive(radius), _positive(height)))
 
 
 def torus(major_radius: float, tube_radius: float) -> Shape:
     major, tube = _positive(major_radius), _positive(tube_radius)
-    return Shape("torus", 3, (major, tube))
+    return Shape("torus", 3, Torus(major, tube))
 
 
 def capsule(start: Iterable[float], end: Iterable[float], radius: float) -> Shape:
     a, b = _point(start, 3), _point(end, 3)
     if a == b:
         raise ValueError("capsule endpoints must differ")
-    return Shape("capsule", 3, (a, b, _positive(radius)))
+    return Shape("capsule", 3, Capsule(a, b, _positive(radius)))
 
 
 def custom_sdf(
@@ -376,387 +449,4 @@ def custom_sdf(
 
     bounds = None if bounds is None else as_aabb(bounds, dim)
     lipschitz = None if lipschitz is None else _positive(lipschitz)
-    return Shape("custom", dim, (fn, material_id, bounds, lipschitz))
-
-
-class Model:
-    """Named, ordered CSG history. Every apply step depends on earlier fields."""
-
-    def __init__(self):
-        self._shapes: dict[str, Shape] = {}
-        self._history: list[dict] = []
-        self._current: str | None = None
-        self._materials: dict[str, dict] = {}
-
-    def material(
-        self,
-        name: str,
-        *,
-        base_color: str,
-        metallic: float = 0.0,
-        roughness: float = 0.8,
-        opacity: float = 1.0,
-    ) -> int:
-        """Define a named finish and return its ID for Shape geometry."""
-        if not isinstance(name, str) or not name.isidentifier():
-            raise ValueError("material name must be a Python identifier")
-        if name in self._materials:
-            raise ValueError(f"material already exists: {name}")
-        index = len(PALETTE) + len(self._materials)
-        if index > 4095:
-            raise ValueError("model cannot define more than 4087 materials")
-        self._materials[name] = {"id": index, **finish(base_color, metallic, roughness, opacity)}
-        return index
-
-    def materials(self) -> dict[str, dict]:
-        """Return JSON-compatible material definitions."""
-        return {name: definition.copy() for name, definition in self._materials.items()}
-
-    def _check_name(self, name: str) -> None:
-        if not isinstance(name, str) or not name.isidentifier():
-            raise ValueError("feature name must be a Python identifier")
-        if name in self._shapes:
-            raise ValueError(f"feature already exists: {name}")
-
-    def define(self, name: str, shape: Shape) -> Shape:
-        """Register an independent field without changing the active result."""
-        self._check_name(name)
-        if not isinstance(shape, Shape):
-            raise ValueError("feature must be a Shape")
-        self._shapes[name] = shape
-        self._history.append({"name": name, "op": "define", "depends_on": []})
-        return shape
-
-    def start(self, name: str, shape: Shape) -> Shape:
-        """Register the initial field and make it the active result."""
-        if not isinstance(shape, Shape) or shape.dim != 3:
-            raise ValueError("model result must be 3D")
-        result = self.define(name, shape)
-        self._current = name
-        return result
-
-    def transform(self, name: str, source: str, transform: Transform) -> Shape:
-        """Define a transformed feature from a previously named field."""
-        self._check_name(name)
-        if source not in self._shapes:
-            raise ValueError("source must name a previously defined field")
-        result = self._shapes[source].transform(transform)
-        self._shapes[name] = result
-        self._history.append({"name": name, "op": "transform", "depends_on": [source]})
-        return result
-
-    def place(
-        self,
-        name: str,
-        source: str,
-        translation=None,
-        *,
-        rotation_matrix=None,
-        axis_angle=None,
-        quaternion=None,
-        rpy=None,
-    ) -> Shape:
-        """Define a placed 3D feature from a previously named solid."""
-        self._check_name(name)
-        if source not in self._shapes:
-            raise ValueError("source must name a previously defined field")
-        result = self._shapes[source].place(
-            translation,
-            rotation_matrix=rotation_matrix,
-            axis_angle=axis_angle,
-            quaternion=quaternion,
-            rpy=rpy,
-        )
-        if not isinstance(result, Shape):
-            raise ValueError("place a 2D profile into a solid before adding it to a model")
-        self._shapes[name] = result
-        self._history.append({"name": name, "op": "place", "depends_on": [source]})
-        return result
-
-    def apply(
-        self, name: str, op: str, tool: str, *, base: str | None = None, radius: float | None = None
-    ) -> Shape:
-        """Apply a named field to the active result (or an explicit earlier base)."""
-        self._check_name(name)
-        base = self._current if base is None else base
-        if base not in self._shapes or tool not in self._shapes:
-            raise ValueError("base and tool must name previously defined fields")
-        if op not in ("min", "max", "subtract", "smooth_union"):
-            raise ValueError("op must be min, max, subtract, or smooth_union")
-        if op != "smooth_union" and radius is not None:
-            raise ValueError("radius is only valid for smooth_union")
-        a, b = self._shapes[base], self._shapes[tool]
-        if a.dim != b.dim:
-            raise ValueError("base and tool must have the same dimension")
-        if a.dim != 3:
-            raise ValueError("model result must be 3D")
-        if op == "min":
-            result = min_(a, b)
-        elif op == "max":
-            result = max_(a, b)
-        elif op == "subtract":
-            result = a - b
-        else:
-            if radius is None:
-                raise ValueError("smooth_union requires radius")
-            result = a.smooth_union(b, _positive(radius))
-        self._shapes[name] = result
-        self._history.append(
-            {
-                "name": name,
-                "op": op,
-                "depends_on": [base, tool],
-                **({"radius": radius} if op == "smooth_union" else {}),
-            }
-        )
-        self._current = name
-        return result
-
-    def scene(self, name: str | None = None) -> Shape:
-        key = self._current if name is None else name
-        if key not in self._shapes or self._shapes[key].dim != 3:
-            raise ValueError("scene must name a 3D model field")
-        return self._shapes[key]
-
-    def history(self) -> list[dict]:
-        """JSON-compatible feature order and direct dependencies."""
-        return [dict(step, depends_on=list(step["depends_on"])) for step in self._history]
-
-
-@dataclass(frozen=True)
-class _CurveSegment:
-    kind: str
-    points: tuple[tuple[float, ...], ...]
-    steps: int = 1
-    sweep: float = 0.0
-
-    def point(self, t: float) -> tuple[float, ...]:
-        p = self.points
-        if self.kind == "arc":
-            center, start, _ = p
-            radius = hypot(start[0] - center[0], start[1] - center[1])
-            angle = atan2(start[1] - center[1], start[0] - center[0]) + t * self.sweep
-            return (center[0] + radius * cos(angle), center[1] + radius * sin(angle))
-        if self.kind == "arc3":
-            center, start, _, normal = p
-            radial = tuple(start[i] - center[i] for i in range(3))
-            side = _cross(normal, radial)
-            return tuple(
-                center[i] + radial[i] * cos(t * self.sweep) + side[i] * sin(t * self.sweep)
-                for i in range(3)
-            )
-        if self.kind == "line":
-            return tuple((1 - t) * a + t * b for a, b in zip(*p, strict=True))
-        if self.kind == "quad":
-            a, b, c = p
-            return tuple(
-                (1 - t) ** 2 * a[i] + 2 * (1 - t) * t * b[i] + t * t * c[i] for i in range(len(a))
-            )
-        raise ValueError(f"unknown curve segment kind: {self.kind}")
-
-    def derivative(self, t: float) -> tuple[float, ...]:
-        p = self.points
-        if self.kind == "arc":
-            center, start, _ = p
-            radius = hypot(start[0] - center[0], start[1] - center[1])
-            angle = atan2(start[1] - center[1], start[0] - center[0]) + t * self.sweep
-            return (-radius * self.sweep * sin(angle), radius * self.sweep * cos(angle))
-        if self.kind == "arc3":
-            center, start, _, normal = p
-            radial = tuple(start[i] - center[i] for i in range(3))
-            side = _cross(normal, radial)
-            return tuple(
-                self.sweep * (-radial[i] * sin(t * self.sweep) + side[i] * cos(t * self.sweep))
-                for i in range(3)
-            )
-        if self.kind == "line":
-            return tuple(b - a for a, b in zip(*p, strict=True))
-        if self.kind == "quad":
-            a, b, c = p
-            return tuple(2 * ((1 - t) * (b[i] - a[i]) + t * (c[i] - b[i])) for i in range(len(a)))
-        raise ValueError(f"unknown curve segment kind: {self.kind}")
-
-
-def _cross(a: tuple[float, ...], b: tuple[float, ...]) -> tuple[float, float, float]:
-    return (a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0])
-
-
-class Curve:
-    """2D or 3D piecewise line, quadratic Bézier, and circular arc curve."""
-
-    def __init__(self, *start: float):
-        start = _vector_args(start)
-        self.dim = len(start)
-        if self.dim not in (2, 3):
-            raise ValueError("curve start must have two or three coordinates")
-        self.start = _point(start, self.dim)
-        self._end = self.start
-        self.segments: list[_CurveSegment] = []
-
-    @staticmethod
-    def _steps(value: int) -> int:
-        if not isinstance(value, int) or isinstance(value, bool) or not 1 <= value <= 128:
-            raise ValueError("curve steps must be an integer from 1 to 128")
-        return value
-
-    def line_to(self, *end: float) -> Curve:
-        point = _point(_vector_args(end), self.dim)
-        if point != self._end:
-            self.segments.append(_CurveSegment("line", (self._end, point)))
-            self._end = point
-        return self
-
-    def quad_to(self, control: Iterable[float], end: Iterable[float], steps: int = 12) -> Curve:
-        control, end = _point(control, self.dim), _point(end, self.dim)
-        self.segments.append(_CurveSegment("quad", (self._end, control, end), self._steps(steps)))
-        self._end = end
-        return self
-
-    def arc_to(
-        self,
-        center: Iterable[float],
-        end: Iterable[float],
-        *,
-        clockwise: bool = False,
-        normal: Iterable[float] | None = None,
-        steps: int = 12,
-    ) -> Curve:
-        """Append a circular arc; 3D arcs require a plane normal."""
-        center, end = _point(center, self.dim), _point(end, self.dim)
-        radial = tuple(a - b for a, b in zip(self._end, center, strict=True))
-        target = tuple(a - b for a, b in zip(end, center, strict=True))
-        r0 = sqrt(sum(v * v for v in radial))
-        r1 = sqrt(sum(v * v for v in target))
-        if r0 == 0 or end == self._end or abs(r0 - r1) > 1e-7 * r0:
-            raise ValueError("arc endpoints must differ and lie on the same circle")
-        if self.dim == 2:
-            if normal is not None:
-                raise ValueError("2D arcs do not take a plane normal")
-            a0 = atan2(radial[1], radial[0])
-            a1 = atan2(target[1], target[0])
-            angle = a1 - a0
-            kind = "arc"
-            points = (center, self._end, end)
-        else:
-            if normal is None:
-                raise ValueError("3D arcs require a plane normal")
-            axis = _point(normal, 3)
-            magnitude = sqrt(sum(v * v for v in axis))
-            if magnitude == 0:
-                raise ValueError("arc plane normal must be nonzero")
-            axis = tuple(v / magnitude for v in axis)
-            if (
-                abs(sum(a * b for a, b in zip(axis, radial, strict=True))) > 1e-7 * r0
-                or abs(sum(a * b for a, b in zip(axis, target, strict=True))) > 1e-7 * r1
-            ):
-                raise ValueError("arc endpoints must lie in the plane normal to the axis")
-            side = _cross(axis, radial)
-            angle = atan2(
-                sum(a * b for a, b in zip(side, target, strict=True)),
-                sum(a * b for a, b in zip(radial, target, strict=True)),
-            )
-            kind = "arc3"
-            points = (center, self._end, end, axis)
-        sweep = angle % (2 * pi)
-        if clockwise:
-            sweep -= 2 * pi
-        if abs(sweep) < 1e-12:
-            raise ValueError("arc sweep must be nonzero")
-        self.segments.append(_CurveSegment(kind, points, self._steps(steps), sweep))
-        self._end = end
-        return self
-
-    def _locate(self, t: float) -> tuple[_CurveSegment, float]:
-        if not self.segments:
-            raise ValueError("curve has no segments")
-        t = _number(t)
-        if not 0 <= t <= 1:
-            raise ValueError("curve parameter must be between 0 and 1")
-        u = t * len(self.segments)
-        index = min(int(u), len(self.segments) - 1)
-        return self.segments[index], u - index
-
-    def point_at(self, t: float) -> tuple[float, ...]:
-        """Evaluate at normalized segment parameter (each command spans 1/N)."""
-        segment, u = self._locate(t)
-        if u == 1:
-            return segment.points[-2] if segment.kind == "arc3" else segment.points[-1]
-        return segment.point(u)
-
-    def tangent_at(self, t: float) -> tuple[float, ...]:
-        segment, u = self._locate(t)
-        derivative = segment.derivative(u)
-        length = sqrt(sum(v * v for v in derivative))
-        if length == 0:
-            raise ValueError("curve tangent is undefined at this parameter")
-        return tuple(v / length for v in derivative)
-
-    def sample(self, tolerance: float = 0.01) -> tuple[tuple[float, ...], ...]:
-        """Flatten segments, subdividing until curve deviation is within tolerance."""
-        tolerance = _positive(tolerance)
-        result = [self.start]
-
-        def append_segment(segment: _CurveSegment, left: float, right: float, depth: int) -> None:
-            a, b = segment.point(left), segment.point(right)
-
-            def deviation(t: float) -> float:
-                point = segment.point(t)
-                u = (t - left) / (right - left)
-                return sqrt(
-                    sum((point[i] - ((1 - u) * a[i] + u * b[i])) ** 2 for i in range(self.dim))
-                )
-
-            error = (
-                max(deviation(left + (right - left) * u) for u in (0.25, 0.5, 0.75))
-                if segment.kind != "line"
-                else 0
-            )
-            if error > tolerance and depth >= 12:
-                raise ValueError("curve tolerance requires more subdivision")
-            if error > tolerance:
-                mid = (left + right) / 2
-                append_segment(segment, left, mid, depth + 1)
-                append_segment(segment, mid, right, depth + 1)
-            elif b != result[-1]:
-                result.append(b)
-
-        for segment in self.segments:
-            for i in range(segment.steps):
-                append_segment(segment, i / segment.steps, (i + 1) / segment.steps, 0)
-            result[-1] = segment.points[-2] if segment.kind == "arc3" else segment.points[-1]
-        return tuple(result)
-
-    def length(self, tolerance: float = 0.01) -> float:
-        points = self.sample(tolerance)
-        return sum(
-            sqrt(sum((b[i] - a[i]) ** 2 for i in range(self.dim)))
-            for a, b in zip(points, points[1:], strict=False)
-        )
-
-    def close(self) -> Shape:
-        if self.dim != 2:
-            raise ValueError("only 2D curves can be closed into a profile")
-        if not self.segments:
-            raise ValueError("a profile needs at least one curve segment")
-        self.line_to(*self.start)
-        return Shape("curve_profile", 2, (tuple(self.segments),))
-
-    def tube(self, radius: float, tolerance: float | None = None, *, closed: bool = False) -> Shape:
-        if self.dim != 3 or not self.segments:
-            raise ValueError("a tube needs a 3D curve with at least one segment")
-        radius = _positive(radius)
-        points = self.sample(min(0.01, radius / 8) if tolerance is None else tolerance)
-        if closed and points[-1] != points[0]:
-            points += (points[0],)
-        if len(points) < 2:
-            raise ValueError("tube curve has no length")
-        return Shape("tube", 3, (points, radius))
-
-    def sweep(self, profile: Shape, *, tolerance=0.01, up=None, closed=False) -> Shape:
-        """Sweep a 2D profile; up selects its initial local Y direction.
-
-        Near-reversals and closed paths requiring extra frame twist are rejected.
-        """
-        from .sweep import sweep
-
-        return sweep(profile, self, tolerance=tolerance, up=up, closed=closed)
+    return Shape("custom", dim, Custom(fn, material_id, bounds, lipschitz))

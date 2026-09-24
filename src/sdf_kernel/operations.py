@@ -3,6 +3,7 @@
 import numpy as np
 
 from .dsl import Shape, _number, _point, _positive
+from .shape_payloads import Extrude, Loft, SectionLoft, VariableExtrude
 
 
 def _axes(axis):
@@ -32,7 +33,7 @@ def loft(sections, *, axis="z") -> Shape:
         positions.append(_number(position))
         profiles.append(profile)
     _positions(positions)
-    return Shape("loft", 3, (tuple(positions), axes), tuple(profiles))
+    return Shape("loft", 3, Loft(tuple(positions), axes), tuple(profiles))
 
 
 def section_loft(profile, stations, *, axis="z") -> Shape:
@@ -45,18 +46,31 @@ def section_loft(profile, stations, *, axis="z") -> Shape:
     for station in stations:
         _positive(station[3])
         _positive(station[4])
-    return Shape("section_loft", 3, (stations, axes), (profile,))
+    return Shape("section_loft", 3, SectionLoft(stations, axes), (profile,))
 
 
-def extrude(profile, height, *, offset=0.0, bounds=None):
+def extrude(
+    profile, height, *, offset=0.0, bounds=None, height_lipschitz=None, offset_lipschitz=None
+):
     from .bounds import as_aabb
 
     height = height if callable(height) else _positive(height)
     offset = offset if callable(offset) else _number(offset)
+    height_lipschitz = None if height_lipschitz is None else _number(height_lipschitz)
+    offset_lipschitz = None if offset_lipschitz is None else _number(offset_lipschitz)
+    if (height_lipschitz is not None and height_lipschitz < 0) or (
+        offset_lipschitz is not None and offset_lipschitz < 0
+    ):
+        raise ValueError("extrusion gradient bounds must be nonnegative")
     if not callable(height) and not callable(offset) and bounds is None:
-        return Shape("extrude", 3, (height, offset), (profile,))
+        return Shape("extrude", 3, Extrude(height, offset), (profile,))
     bounds = None if bounds is None else as_aabb(bounds, 3)
-    return Shape("variable_extrude", 3, (height, offset, bounds), (profile,))
+    return Shape(
+        "variable_extrude",
+        3,
+        VariableExtrude(height, offset, bounds, height_lipschitz, offset_lipschitz),
+        (profile,),
+    )
 
 
 def _capped(planar, axial):
@@ -67,14 +81,14 @@ def _capped(planar, axial):
 
 def evaluate_operation(node, q, evaluate):
     if node.kind == "variable_extrude":
-        height, offset, _ = node.data
+        height, offset = node.data.height, node.data.offset
         x, y, z = q[..., 0], q[..., 1], q[..., 2]
         height = np.asarray(height(x, y) if callable(height) else height)
         offset = np.asarray(offset(x, y) if callable(offset) else offset)
         distance, material = evaluate(node.children[0], q[..., :2])
         distance = _capped(distance, np.abs(z - offset) - height / 2)
     else:
-        stations, (axis, transverse) = node.data
+        stations, (axis, transverse) = node.data.stations, node.data.axes
         z = q[..., axis]
         xy = q[..., np.asarray(transverse)]
         if node.kind == "section_loft":
@@ -108,7 +122,7 @@ def operation_bounds(node, level, analytic):
 
     padding = max(0.0, level)
     if node.kind == "variable_extrude":
-        height, offset, box = node.data
+        height, offset, box = node.data.height, node.data.offset, node.data.bounds
         if box is not None and level <= 0:
             return box
         planar = analytic(node.children[0], level)
@@ -120,7 +134,7 @@ def operation_bounds(node, level, analytic):
             (*planar.minimum, offset - height / 2 - padding),
             (*planar.maximum, offset + height / 2 + padding),
         )
-    stations, (axis, transverse) = node.data
+    stations, (axis, transverse) = node.data.stations, node.data.axes
     if node.kind == "loft":
         planar = _empty(2)
         for profile in node.children:

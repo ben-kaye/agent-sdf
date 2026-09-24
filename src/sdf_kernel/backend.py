@@ -195,15 +195,15 @@ def evaluate_shape(shape, points):
         child = node.children[0] if node.children else None
         zero = np.zeros(q.shape[:-1], dtype=np.int32)
         if kind in ("circle", "sphere"):
-            return _length(q) - data[0], zero
+            return _length(q) - data.radius, zero
         if kind == "rectangle":
-            w, h, radius = data
+            w, h, radius = data.width, data.height, data.corner_radius
             return _round_box(q, (w / 2, h / 2), radius), zero
         if kind == "box":
-            w, depth, h, radius = data
+            w, depth, h, radius = data.width, data.depth, data.height, data.corner_radius
             return _round_box(q, (w / 2, depth / 2, h / 2), radius), zero
         if kind == "polygon":
-            vertices = data[0]
+            vertices = data.vertices
             distance = np.full(q.shape[:-1], np.inf)
             inside = np.zeros(q.shape[:-1], dtype=bool)
             for a, b in zip(vertices, vertices[1:] + vertices[:1], strict=False):
@@ -215,28 +215,28 @@ def evaluate_shape(shape, points):
                 inside = np.logical_xor(inside, crossing & (q[..., 0] < x_edge))
             return np.where(inside, -distance, distance), zero
         if kind == "curve_profile":
-            return _curve_profile(q, data[0]), zero
+            return _curve_profile(q, data.segments), zero
         if kind == "cylinder":
-            radius, height = data
+            radius, height = data.radius, data.height
             v = np.stack((_length(q[..., :2]) - radius, np.abs(q[..., 2]) - height / 2), axis=-1)
             return _length(np.maximum(v, 0)) + np.minimum(np.max(v, axis=-1), 0), zero
         if kind == "torus":
-            major, tube = data
+            major, tube = data.major_radius, data.tube_radius
             v = np.stack((_length(q[..., :2]) - major, q[..., 2]), axis=-1)
             return _length(v) - tube, zero
         if kind in ("capsule", "tube"):
             segments = (
-                [(data[0], data[1])]
+                [(data.start, data.end)]
                 if kind == "capsule"
-                else list(zip(data[0], data[0][1:], strict=False))
+                else list(zip(data.points, data.points[1:], strict=False))
             )
-            radius = data[2] if kind == "capsule" else data[1]
+            radius = data.radius
             distance = np.full(q.shape[:-1], np.inf)
             for a, b in segments:
                 distance = np.minimum(distance, _segment(q, a, b))
             return distance - radius, zero
-        if kind in ("custom", "python"):
-            fn, material = data[:2]
+        if kind == "custom":
+            fn, material = data.fn, data.material_id
             value = fn(*[q[..., axis] for axis in range(node.dim)])
             distance, material = (
                 (value.distance, value.material) if isinstance(value, Hit) else (value, material)
@@ -254,21 +254,42 @@ def evaluate_shape(shape, points):
                 return np.maximum(da, db), np.where(da > db, ma, mb)
             if kind == "subtract":
                 return np.maximum(da, -db), ma
-            radius = data[0]
+            radius = data.radius
             h = np.maximum(radius - np.abs(da - db), 0) / radius
             return np.minimum(da, db) - h * h * radius * 0.25, np.where(da < db, ma, mb)
         if kind == "translate":
-            return evaluate(child, q - np.asarray(data))
+            return evaluate(child, q - np.asarray(data.offset))
+        if kind == "linear_pattern":
+            step = np.asarray(data.step)
+            best, material = evaluate(child, q)
+            for index in range(1, data.count):
+                distance, candidate = evaluate(child, q - index * step)
+                material = np.where(distance <= best, candidate, material)
+                best = np.minimum(best, distance)
+            return best, material
+        if kind == "radial_pattern":
+            best, material = evaluate(child, q)
+            a, b = {"x": (1, 2), "y": (2, 0), "z": (0, 1)}[data.axis]
+            for index in range(1, data.count):
+                angle = 2 * np.pi * index / data.count
+                c, s = np.cos(angle), np.sin(angle)
+                mapped = np.array(q, dtype=float, copy=True)
+                mapped[..., a] = c * q[..., a] + s * q[..., b]
+                mapped[..., b] = -s * q[..., a] + c * q[..., b]
+                distance, candidate = evaluate(child, mapped)
+                material = np.where(distance <= best, candidate, material)
+                best = np.minimum(best, distance)
+            return best, material
         if kind == "scale":
-            distance, material = evaluate(child, q / data[0])
-            return distance * data[0], material
+            distance, material = evaluate(child, q / data.factor)
+            return distance * data.factor, material
         if kind == "transform":
-            transform = data[0]
+            transform = data.transform
             mapped = transform.map_points(q)
             distance, material = evaluate(child, mapped)
             return distance * transform.distance_scale, material
         if kind == "rotate":
-            angle, axis = data
+            angle, axis = data.angle, data.axis
             c, s = np.cos(angle), np.sin(angle)
             x, y = q[..., 0], q[..., 1]
             if node.dim == 2:
@@ -284,13 +305,15 @@ def evaluate_shape(shape, points):
             return evaluate(child, mapped)
         if kind == "offset":
             distance, material = evaluate(child, q)
-            return distance - data[0], material
+            return distance - data.amount, material
         if kind == "shell":
             distance, material = evaluate(child, q)
-            return np.abs(distance) - data[0] / 2, material
+            return np.abs(distance) - data.thickness / 2, material
+        if kind == "feature":
+            return evaluate(child, q)
         if kind == "material":
             distance, _ = evaluate(child, q)
-            return distance, zero + data[0]
+            return distance, zero + data.material_id
         if kind in ("loft", "section_loft", "variable_extrude"):
             from .operations import evaluate_operation
 
@@ -301,8 +324,8 @@ def evaluate_shape(shape, points):
             return evaluate_sweep(node, q, evaluate)
         if kind == "extrude":
             distance, material = evaluate(child, q[..., :2])
-            offset = data[1] if len(data) > 1 else 0.0
-            v = np.stack((distance, np.abs(q[..., 2] - offset) - data[0] / 2), axis=-1)
+            offset = data.offset
+            v = np.stack((distance, np.abs(q[..., 2] - offset) - data.height / 2), axis=-1)
             return _length(np.maximum(v, 0)) + np.minimum(np.max(v, axis=-1), 0), material
         if kind == "revolve":
             profile = np.stack((_length(q[..., :2]), q[..., 2]), axis=-1)
