@@ -1,18 +1,35 @@
+We are creating an expressive Python geometry API for building, combining, and inspecting 2D and 3D shapes, with CAD-like spatial operations and procedural geometry as first-class features.
 
-# rules
-DOCS MUST BE EXTREMELY CONCISE. WELL LAYED OUT. SMALL PURPOSE
-if implementing do not modify docs
-use subagents if appropriate (class == sol)
-question bad decisions
-everything is subject to change, do not be afraid to suggest a foundational change
+Geometry at its lowest level is defined with fields.
 
-## conventions
-z-up, right handed axes
-camera follows a -Z ray axis, +Y up right handed local axes
-quaternions (w,x,y,z)
+# Working rules
+
+- Keep documentation extremely concise, well laid out, and focused on a small purpose.
+- When implementing code, do not modify documentation.
+- Use subagents when appropriate, and select a Sol-class model for them.
+- Challenge decisions that appear unsound. Suggest foundational changes when warranted; everything is subject to change
+- Public APIs must be discussed. They should be convenient, explanatory and concise. Ideally, the Schelling point of intent.
 
 
-## implementation
-no persistent tests. do not look at tests/ do not run tests/
-no compatibility engineering, migrate examples to latest api if needed
-address `ruff check .` on completion of changes and run `ruff format .`
+## Conventions
+
+- Use right-handed, Z-up world axes.
+- The camera looks along local -Z, with local +Y up and right-handed local axes.
+- Write quaternions as `(w, x, y, z)`.
+
+## Implementation
+
+- Do not add persistent tests, inspect `tests/`, or run `tests/`.
+- Do not add compatibility support. Migrate examples to the latest API when needed.
+- Do not reference documentation in code.
+- On completion, run `ruff format .` and address all findings from `ruff check .`.
+
+
+## Creation / generation
+
+When a user asks you to create geometry, follow these rules:
+
+- Do not inspect `src/`.
+- Read `README.md` and use the public API. Compose its operations into high-level procedures as needed.
+- Use `custom_sdf` when the public operations cannot express the shape clearly.
+- Render and inspect the result. If the documented API is unclear or insufficient, report the specific gap.
