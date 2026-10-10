@@ -61,5 +61,5 @@ class Warp:
             raise ValueError(f"point must have {self.dim} coordinates")
         return tuple(float(value) for value in self.map_points(point))
 
-    def __call__(self, field, *, bounds=None):
+    def __call__(self, field, *, bounds):
         return field.warp(self, bounds=bounds)

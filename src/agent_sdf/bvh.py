@@ -11,7 +11,7 @@ import numpy as np
 from .bounds import AABB
 
 if TYPE_CHECKING:
-    from .dsl import Field
+    from .field import Field
 
 
 @dataclass(frozen=True)
@@ -27,7 +27,7 @@ class BVHNode:
 
 def _union_components(field: Field) -> list[Field]:
     """Flatten unions through point maps and labels, preserving other CSG."""
-    from .dsl import Field
+    from .field import Field
 
     distributive = {"transform", "slice", "warp", "material", "feature"}
     components = []

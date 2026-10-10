@@ -2,15 +2,10 @@
 
 import numpy as np
 
-from .dsl import Field, LoftStation, _number, _positive
-from .field_payloads import Extrude, FieldMorph, Loft, VariableExtrude
+from .field import Field, LoftStation, _number, _positive
+from .nodes import Extrude, FieldMorph, Loft, VariableExtrude
 
-
-def _axes(axis, operation):
-    if axis not in ("x", "y", "z"):
-        raise ValueError(f"{operation} axis must be x, y, or z")
-    axial = "xyz".index(axis)
-    return axial, tuple(i for i in range(3) if i != axial)
+_Z_AXES = (2, (0, 1))
 
 
 def _positions(values, operation):
@@ -18,13 +13,8 @@ def _positions(values, operation):
         raise ValueError(f"{operation} needs at least two strictly increasing station positions")
 
 
-def field_morph(sections, *, axis="z") -> Field:
-    """Interpolate 2D signed fields at (position, profile) sections, with flat caps.
-
-    This implicit morph is a distance estimate; use profile.loft for interpolated
-    offsets/scales of one profile. Transverse coordinates follow world axis order.
-    """
-    axes = _axes(axis, "field_morph")
+def field_morph(sections) -> Field:
+    """Interpolate 2D signed fields at (position, profile) sections along Z, with flat caps."""
     sections = tuple(sections)
     positions, profiles = [], []
     for position, profile in sections:
@@ -33,20 +23,53 @@ def field_morph(sections, *, axis="z") -> Field:
         positions.append(_number(position))
         profiles.append(profile)
     _positions(positions, "field_morph")
-    return Field("field_morph", 3, FieldMorph(tuple(positions), axes), tuple(profiles))
+    return Field("field_morph", 3, FieldMorph(tuple(positions), _Z_AXES), tuple(profiles))
 
 
-def loft(profile, stations, *, axis="z") -> Field:
-    """Linearly interpolate profile offsets and positive axis scales between stations."""
+def loft_sketches(sketches) -> Field:
+    from .plane import Plane, _dot
+    from .transform import Transform
+
+    first = sketches[0].plane
+    normal = first.normal
+    for sketch in sketches[1:]:
+        if abs(abs(_dot(sketch.plane.normal, normal)) - 1) > 1e-9:
+            raise ValueError("loft sketches must lie on parallel planes")
+    if (
+        _dot(
+            tuple(b - a for a, b in zip(first.origin, sketches[-1].plane.origin, strict=True)),
+            normal,
+        )
+        < 0
+    ):
+        normal = tuple(-value for value in normal)
+    frame = Plane(first.origin, normal, x_direction=first.x_direction)
+    sections = []
+    for sketch in sketches:
+        plane = sketch.plane
+        delta = tuple(b - a for a, b in zip(frame.origin, plane.origin, strict=True))
+        axes = (frame.x_direction, frame.y_direction)
+        matrix = tuple(
+            (_dot(plane.x_direction, axis), _dot(plane.y_direction, axis)) for axis in axes
+        )
+        profile = sketch.profile.transform(
+            Transform(matrix, tuple(_dot(delta, axis) for axis in axes))
+        )
+        sections.append((_dot(delta, frame.normal), profile))
+    _positions([position for position, _ in sections], "loft")
+    return field_morph(sections).place(frame.as_placement())
+
+
+def loft(profile, stations) -> Field:
+    """Linearly interpolate profile offsets and positive scales between Z stations."""
     if not isinstance(profile, Field) or profile.dim != 2:
         raise ValueError("loft requires a 2D profile")
-    axes = _axes(axis, "loft")
     stations = tuple(stations)
     if any(not isinstance(station, LoftStation) for station in stations):
         raise ValueError("loft stations must be LoftStation values")
     _positions([station.position for station in stations], "loft")
     stations = tuple((station.position, *station.offset, *station.scale) for station in stations)
-    return Field("loft", 3, Loft(stations, axes), (profile,))
+    return Field("loft", 3, Loft(stations, _Z_AXES), (profile,))
 
 
 def extrude(
@@ -64,7 +87,9 @@ def extrude(
         raise ValueError("extrusion gradient bounds must be nonnegative")
     if not callable(height) and not callable(offset) and bounds is None:
         return Field("extrude", 3, Extrude(height, offset), (profile,))
-    bounds = None if bounds is None else as_aabb(bounds, 3)
+    if bounds is None:
+        raise ValueError("callable extrusion requires finite bounds to cap the geometry")
+    bounds = as_aabb(bounds, 3)
     return Field(
         "variable_extrude",
         3,
@@ -82,7 +107,9 @@ def _capped(planar, axial):
 def evaluate_operation(node, q, evaluate):
     if node.kind == "variable_extrude":
         height, offset = node.data.height, node.data.offset
-        x, y, z = q[..., 0], q[..., 1], q[..., 2]
+        box = node.data.bounds
+        xy = np.clip(q[..., :2], box.minimum[:2], box.maximum[:2])
+        x, y, z = xy[..., 0], xy[..., 1], q[..., 2]
         height = np.asarray(height(x, y) if callable(height) else height)
         offset = np.asarray(offset(x, y) if callable(offset) else offset)
         distance, material = evaluate(node.children[0], q[..., :2])
@@ -123,16 +150,19 @@ def operation_bounds(node, level, analytic):
     padding = max(0.0, level)
     if node.kind == "variable_extrude":
         height, offset, box = node.data.height, node.data.offset, node.data.bounds
-        if box is not None and level <= 0:
-            return box
+        bounded = box.expanded(padding)
         planar = analytic(node.children[0], level)
         if planar.is_empty:
             return _empty(3)
         if callable(height) or callable(offset):
-            return AABB((*planar.minimum, -float("inf")), (*planar.maximum, float("inf")))
-        return AABB(
-            (*planar.minimum, offset - height / 2 - padding),
-            (*planar.maximum, offset + height / 2 + padding),
+            return bounded.intersection(
+                AABB((*planar.minimum, -float("inf")), (*planar.maximum, float("inf")))
+            )
+        return bounded.intersection(
+            AABB(
+                (*planar.minimum, offset - height / 2 - padding),
+                (*planar.maximum, offset + height / 2 + padding),
+            )
         )
     stations, (axis, transverse) = node.data.stations, node.data.axes
     if node.kind == "field_morph":

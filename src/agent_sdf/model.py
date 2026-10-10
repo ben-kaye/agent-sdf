@@ -8,12 +8,11 @@ from types import MappingProxyType
 
 import numpy as np
 
-from .anchor import AnchorPlane
-from .dsl import Field, min_
-from .field_payloads import Feature
-from .field_payloads import Material as MaterialPayload
-from .materials import PALETTE, Material, validate_material_id
-from .plane import Plane
+from .field import Field, min_
+from .material import PALETTE, Material, validate_material_id
+from .nodes import Feature
+from .nodes import Material as MaterialPayload
+from .plane import AnchorPlane, Plane
 from .transform import Placement, _vector3
 
 

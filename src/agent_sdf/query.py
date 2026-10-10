@@ -8,7 +8,7 @@ from math import cos, isfinite, radians, sin, sqrt, tan
 import numpy as np
 
 from .camera import _orientation, _orientation_up
-from .dsl import Field
+from .field import Field
 from .model import compile_scene
 
 
@@ -113,7 +113,23 @@ def _contributors(field, point):
     elif kind in ("extrude", "variable_extrude"):
         point = point[:2]
     elif kind == "revolve":
-        point = np.array((np.linalg.norm(point[:2]), point[2]))
+        x, y, z = point
+        r = np.hypot(x, y)
+        phi = np.arctan2(y, x) % (2 * np.pi)
+        c, s = np.cos(data.angle), np.sin(data.angle)
+        candidates = [
+            (_distance(child, np.array((u, z))), np.array((u, z)))
+            for u, swept in (
+                (r, phi <= data.angle),
+                (-r, (phi + np.pi) % (2 * np.pi) <= data.angle),
+            )
+            if swept or data.angle >= 2 * np.pi
+        ]
+        if data.angle < 2 * np.pi:
+            for u, w in ((x, y), (c * x + s * y, c * y - s * x)):
+                distance = _distance(child, np.array((u, z)))
+                candidates.append((np.hypot(max(distance, 0.0), w), np.array((u, z))))
+        point = min(candidates, key=lambda item: item[0])[1]
     elif kind == "loft":
         stations, (axis, transverse) = data.stations, data.axes
         table = np.asarray(stations)

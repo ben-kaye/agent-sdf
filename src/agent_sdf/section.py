@@ -8,7 +8,7 @@ from math import ceil, hypot, isfinite
 import numpy as np
 
 from .bounds import as_aabb
-from .dsl import Field
+from .field import Field
 from .model import compile_scene
 from .plane import Plane
 

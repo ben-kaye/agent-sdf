@@ -54,9 +54,9 @@ World axes are right-handed with Z up. Cameras look along local −Z with local 
 | Combine | `a \| b` union, `a & b` intersection, `a - b` difference, `a ^ b` symmetric difference, `a.smooth_union(b, radius)`. Operands must have the same dimension. |
 | Transform | `.translate(*offset)`, `.rotate(angle, axis="z")`, `.scale(factor)`, `.transform(Transform(...))`, `.place(Placement(...))` |
 | Modify | `.offset(amount)`, `.shell(thickness)`, `.linear_pattern(count, *step)`, `.radial_pattern(count, axis="z")`, `.with_material(id)`, `.named(name)` |
-| Make solids | On a 2D field: `.extrude(height, offset=0)`, `.revolve(axis="x")` or `axis="y"`, `.loft([LoftStation(position, offset=(u, v), scale=s), ...])`, `.sweep(curve)`. `field_morph([(position, profile), ...])` blends different profiles. |
+| Make solids | On a 2D field: `.extrude(height, offset=0)`, `.revolve(axis="x")` or `axis="y"`, `.loft([LoftStation(position, offset=(u, v), scale=s), ...])`, `.sweep(curve)`. `loft(*sketches)` blends different sketches on parallel planes, in order. |
 | Curves | `Curve(*start).line_to(*end).quad_to(control, end).arc_to(center, end)`. Use `.close()` for a 2D profile or `.tube(radius)` for a 3D tube; 3D arcs require `normal`. |
-| Planes | `Plane.xy(z=0)`, `.xz(y=0)`, `.yz(x=0)`, or `Plane(origin, normal, x_direction=...)`. `profile.on(plane)` creates a `Sketch` for extrusion, lofting, or revolution. `AnchorPlane` adds named points: `.define_point(name, point)`, `.point(name, space="world")`. |
+| Planes | `Plane.xy(z=0)`, `.xz(y=0)`, `.yz(x=0)`, or `Plane(origin, normal, x_direction=...)`. `profile.on(plane)` creates a `Sketch` for extrusion, revolution, `.loft(stations)`, or `loft(*sketches)`. `AnchorPlane` adds named points: `.define_point(name, point)`, `.point(name, space="world")`. |
 
 Placement, shells, radial patterns, and materials require 3D fields. `Transform` is affine; `Placement` is rigid. Compose either with `.then(other)`.
 
@@ -84,4 +84,4 @@ Browse the [examples](examples) for complete models.
 
 ## License
 
-Copyright ©️ 2026 Ben Kaye. Licensed under the [MIT License](LICENSE).
+Copyright © 2026 Ben Kaye. Licensed under the [MIT License](LICENSE).

@@ -14,6 +14,11 @@ def _round_box(p, half_size, radius):
     return _length(np.maximum(q, 0)) + np.minimum(np.max(q, axis=-1), 0) - radius
 
 
+def _bounds_distance(p, bounds):
+    lower, upper = np.asarray(bounds.minimum), np.asarray(bounds.maximum)
+    return _round_box(p - (lower / 2 + upper / 2), upper / 2 - lower / 2, 0)
+
+
 def _segment(p, a, b):
     a, b = np.asarray(a), np.asarray(b)
     edge = b - a
@@ -234,14 +239,17 @@ def evaluate_field(field, points):
                 distance = np.minimum(distance, _segment(q, a, b))
             return distance - radius, zero
         if kind == "custom":
-            from .field import evaluate as evaluate_field
+            from .expr import evaluate as evaluate_field
 
             coordinates = [q[..., axis] for axis in range(node.dim)]
             coordinates.extend([0.0] * (3 - node.dim))
             distance = evaluate_field(data.distance, *coordinates)
             material = evaluate_field(data.material, *coordinates)
             return (
-                np.broadcast_to(np.asarray(distance), q.shape[:-1]),
+                np.maximum(
+                    np.broadcast_to(np.asarray(distance), q.shape[:-1]),
+                    _bounds_distance(q, data.bounds),
+                ),
                 np.broadcast_to(np.asarray(material, dtype=np.int32), q.shape[:-1]),
             )
         if kind in ("min", "max", "subtract", "smooth_union"):
@@ -267,7 +275,9 @@ def evaluate_field(field, points):
         if kind == "warp":
             warp = data.warp
             distance, material = evaluate(child, warp.map_points(q))
-            return distance * warp.distance_scale, material
+            return np.maximum(
+                distance * warp.distance_scale, _bounds_distance(q, data.bounds)
+            ), material
         if kind == "linear_pattern":
             step = np.asarray(data.step)
             best, material = evaluate(child, q)
@@ -306,9 +316,12 @@ def evaluate_field(field, points):
             distance, _ = evaluate(child, q)
             return distance, zero + data.material_id
         if kind in ("field_morph", "loft", "variable_extrude"):
-            from .operations import evaluate_operation
+            from .profiles import evaluate_operation
 
-            return evaluate_operation(node, q, evaluate)
+            distance, material = evaluate_operation(node, q, evaluate)
+            if kind == "variable_extrude":
+                distance = np.maximum(distance, _bounds_distance(q, data.bounds))
+            return distance, material
         if kind == "profile_sweep":
             from .sweep import evaluate_sweep
 
@@ -319,8 +332,38 @@ def evaluate_field(field, points):
             v = np.stack((distance, np.abs(q[..., 2] - offset) - data.height / 2), axis=-1)
             return _length(np.maximum(v, 0)) + np.minimum(np.max(v, axis=-1), 0), material
         if kind == "revolve":
-            profile = np.stack((_length(q[..., :2]), q[..., 2]), axis=-1)
-            return evaluate(child, profile)
+            return _revolve(data.angle, q, lambda u: evaluate(child, np.stack((u, q[..., 2]), -1)))
         raise ValueError(f"unknown field kind: {kind}")
 
     return evaluate(field, p)
+
+
+def _revolve(angle, q, profile):
+    """Revolve a profile, sampled by radial coordinate, about Z from +X through angle.
+
+    Candidates are the meridian planes at and opposite the point, when swept,
+    and both end caps; their minimum is exact for exact profiles.
+    """
+    x, y = q[..., 0], q[..., 1]
+    r = np.hypot(x, y)
+    near, near_material = profile(r)
+    far, far_material = profile(-r)
+    if angle >= 2 * pi:
+        return np.minimum(near, far), np.where(near <= far, near_material, far_material)
+    phi = np.mod(np.arctan2(y, x), 2 * pi)
+    near = np.where(phi <= angle, near, np.inf)
+    far = np.where(np.mod(phi + pi, 2 * pi) <= angle, far, np.inf)
+    meridian = np.minimum(near, far)
+    material = np.where(near <= far, near_material, far_material)
+    c, s = np.cos(angle), np.sin(angle)
+    end_y = c * y - s * x
+    start, start_material = profile(x)
+    end, end_material = profile(c * x + s * y)
+    start = np.hypot(np.maximum(start, 0), y)
+    end = np.hypot(np.maximum(end, 0), end_y)
+    material = np.where(start < meridian, start_material, material)
+    outside = np.minimum(meridian, start)
+    material = np.where(end < outside, end_material, material)
+    outside = np.minimum(outside, end)
+    inside = np.maximum(meridian, -np.minimum(np.abs(y), np.abs(end_y)))
+    return np.where(meridian < 0, inside, outside), material

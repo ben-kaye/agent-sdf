@@ -6,7 +6,7 @@ import builtins
 
 import numpy as np
 
-from .field import Scalar, as_scalar, call, max_, min_
+from .expr import Scalar, as_scalar, call, max_, min_
 
 pi = float(np.pi)
 inf = float(np.inf)

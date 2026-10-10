@@ -5,8 +5,8 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-from .dsl import Field
-from .materials import scene_materials
+from .field import Field
+from .material import scene_materials
 from .model import Assembly, CompiledScene, Instance, Part, Scene, compile_scene
 
 

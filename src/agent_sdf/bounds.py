@@ -2,7 +2,7 @@
 
 from collections import namedtuple
 from itertools import product
-from math import hypot, inf, isfinite
+from math import cos, hypot, inf, isfinite, pi, sin
 
 
 def _coordinate(value):
@@ -122,6 +122,26 @@ def _slice_bounds(box, plane):
     )
 
 
+def revolve_bounds(box, angle):
+    """Bound a (radial, axial) profile box revolved about Z from +X through angle."""
+    (u0, z0), (u1, z1) = box.minimum, box.maximum
+    if not all(isfinite(x) for x in (u0, u1)):
+        return AABB((-inf, -inf, z0), (inf, inf, z1))
+    if angle >= 2 * pi:
+        radius = max(-u0, u1, 0.0)
+        return AABB((-radius, -radius, z0), (radius, radius, z1))
+    points = []
+    # Profile points at negative radial coordinates sweep from the opposite side.
+    for low, high, start in ((max(u0, 0.0), u1, 0.0), (max(-u1, 0.0), -u0, pi)):
+        if high < 0:
+            continue
+        turns = (k * pi / 2 for k in range(1, 8) if start < k * pi / 2 < start + angle)
+        for a in (start, start + angle, *turns):
+            points += [(radius * cos(a), radius * sin(a)) for radius in (low, high)]
+    xs, ys = zip(*points, strict=True)
+    return AABB((min(xs), min(ys), z0), (max(xs), max(ys), z1))
+
+
 def _analytic(field, level=0.0):
     """Bound {p: field(p) <= level}; carry offsets through distance scaling."""
     kind, data, dim = field.kind, field.data, field.dim
@@ -160,10 +180,8 @@ def _analytic(field, level=0.0):
                 box = _points_bounds(segment.points)
             result = result.union(box)
         return result.expanded(padding)
-    if kind == "custom":
-        if level <= 0 and data.bounds is not None:
-            return data.bounds
-        return _unknown(dim)
+    if kind in ("custom", "warp"):
+        return data.bounds.expanded(padding)
     if kind in ("min", "max", "subtract", "smooth_union"):
         threshold = level + (data.radius / 4 if kind == "smooth_union" else 0)
         a = _analytic(child, threshold)
@@ -210,10 +228,8 @@ def _analytic(field, level=0.0):
         )
     if kind == "slice":
         return _slice_bounds(_analytic(child, level), data.plane)
-    if kind == "warp":
-        return data.bounds if level <= 0 and data.bounds is not None else _unknown(dim)
     if kind in ("field_morph", "loft", "variable_extrude"):
-        from .operations import operation_bounds
+        from .profiles import operation_bounds
 
         return operation_bounds(field, level, _analytic)
     if kind == "profile_sweep":
@@ -231,10 +247,11 @@ def _analytic(field, level=0.0):
         )
     if kind == "revolve":
         box = _analytic(child, level)
-        if box.is_empty or box.maximum[0] < 0:
+        if box.is_empty:
             return _empty(dim)
-        radius = box.maximum[0]
-        return AABB((-radius, -radius, box.minimum[1]), (radius, radius, box.maximum[1]))
+        if data.angle >= 2 * pi:
+            return revolve_bounds(box, data.angle)
+        return revolve_bounds(box, data.angle).expanded(padding)
     return _unknown(dim)
 
 

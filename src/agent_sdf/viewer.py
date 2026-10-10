@@ -17,7 +17,7 @@ from urllib.parse import urlsplit
 
 from .bounds import as_aabb
 from .glsl import compile_glsl, feature_names
-from .materials import material_arrays
+from .material import material_arrays
 from .query import ray_cast
 from .scene_loader import load_scene
 
@@ -103,7 +103,12 @@ def main():
         help="conservative scene bounds for fields without analytic bounds",
     )
     parser.add_argument("--no-open", action="store_true")
-    parser.add_argument("--bvh", action="store_true", help="prune bounded union components on GPU")
+    parser.add_argument(
+        "--bvh",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="accelerate bounded geometry on GPU (default: enabled)",
+    )
     args = parser.parse_args()
     try:
         if not 1 <= args.port <= 65535:
@@ -200,7 +205,7 @@ def main():
     watcher = threading.Thread(target=watch_source, name="glsl-source-watcher", daemon=True)
     watcher.start()
 
-    html = Path(__file__).with_name("glsl_viewer.html")
+    html = Path(__file__).with_name("viewer.html")
 
     class Handler(BaseHTTPRequestHandler):
         def _json(self, status_code, payload):

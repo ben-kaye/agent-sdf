@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from math import isfinite
+from math import isfinite, pi
 from typing import Any, NamedTuple
 
 
@@ -129,11 +129,16 @@ class Loft(NamedTuple):
     axes: tuple[int, tuple[int, int]]
 
 
+class Revolve(NamedTuple):
+    angle: float
+
+
 class Sweep(NamedTuple):
     points: tuple[tuple[float, float, float], ...]
     frames: tuple[Any, ...]
     tolerance: float
     closed: bool
+    orientation: str
 
 
 Payload = (
@@ -163,6 +168,7 @@ Payload = (
     | FieldMorph
     | Loft
     | Sweep
+    | Revolve
 )
 
 _SPECS = {
@@ -195,7 +201,7 @@ _SPECS = {
     "field_morph": (FieldMorph, 3, None),
     "loft": (Loft, 3, 1),
     "profile_sweep": (Sweep, 3, 1),
-    "revolve": (Empty, 3, 1),
+    "revolve": (Revolve, 3, 1),
 }
 
 
@@ -299,16 +305,19 @@ def validate_field(kind: str, dim: int, data: Payload, children: tuple[Any, ...]
         )
     ):
         raise ValueError("curve profile needs valid 2D segments")
+    if kind in ("custom", "warp", "variable_extrude"):
+        from .bounds import AABB, as_aabb
+
+        if not isinstance(data.bounds, AABB):
+            raise ValueError(f"{kind} requires finite AABB bounds to cap the geometry")
+        as_aabb(data.bounds, dim)
     if kind == "custom":
-        from .bounds import AABB
-        from .field import Scalar
+        from .expr import Scalar
 
         if not isinstance(data.distance, Scalar) or data.distance.kind != "float":
             raise ValueError("custom distance must be a scalar field")
         if not isinstance(data.material, Scalar) or data.material.kind != "float":
             raise ValueError("custom material must be a scalar field")
-        if data.bounds is not None and not isinstance(data.bounds, AABB):
-            raise ValueError("custom bounds must be an AABB")
         if not _finite(data.lipschitz, positive=True):
             raise ValueError("custom Lipschitz bound must be positive and finite")
     if kind == "smooth_union" and not _finite(data.radius, positive=True):
@@ -334,15 +343,10 @@ def validate_field(kind: str, dim: int, data: Payload, children: tuple[Any, ...]
         if not isinstance(data.transform, Transform) or data.transform.dim != dim:
             raise ValueError("transform dimension must match field")
     if kind == "warp":
-        from .bounds import AABB, as_aabb
         from .warp import Warp
 
         if not isinstance(data.warp, Warp) or data.warp.dim != dim:
             raise ValueError("warp dimension must match field")
-        if data.bounds is not None:
-            if not isinstance(data.bounds, AABB):
-                raise ValueError("warp bounds must be an AABB")
-            as_aabb(data.bounds, dim)
     if kind == "offset" and not _finite(data.amount):
         raise ValueError("offset requires a finite value")
     if kind == "shell" and not _finite(data.thickness, positive=True):
@@ -352,7 +356,7 @@ def validate_field(kind: str, dim: int, data: Payload, children: tuple[Any, ...]
     ):
         raise ValueError("feature name must contain identifier path segments")
     if kind == "material":
-        from .materials import validate_material_id
+        from .material import validate_material_id
 
         validate_material_id(data.material_id)
     if kind == "extrude" and not (_finite(data.height, positive=True) and _finite(data.offset)):
@@ -388,6 +392,8 @@ def validate_field(kind: str, dim: int, data: Payload, children: tuple[Any, ...]
         and tuple(sorted((*data.axes[1], data.axes[0]))) == (0, 1, 2)
     ):
         raise ValueError(f"{kind} needs ordered stations and valid axes")
+    if kind == "revolve" and not (_finite(data.angle, positive=True) and data.angle <= 2 * pi):
+        raise ValueError("revolve angle must be in (0, 2*pi]")
     if kind == "profile_sweep" and not (
         len(data.points) >= 2
         and len(data.frames) == len(data.points) - 1
@@ -397,5 +403,6 @@ def validate_field(kind: str, dim: int, data: Payload, children: tuple[Any, ...]
         )
         and _finite(data.tolerance, positive=True)
         and isinstance(data.closed, bool)
+        and data.orientation in ("perpendicular", "parallel")
     ):
         raise ValueError("sweep needs matching points and frames")

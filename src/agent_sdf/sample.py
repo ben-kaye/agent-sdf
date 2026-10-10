@@ -4,6 +4,6 @@ from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
-class Hit:
+class Sample:
     distance: object
     material: object = 0

@@ -6,8 +6,8 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from math import atan2, cos, hypot, pi, sin, sqrt
 
-from .dsl import Field, _number, _point, _positive
-from .field_payloads import CurveProfile, Tube
+from .field import Field, _number, _point, _positive
+from .nodes import CurveProfile, Tube
 from .transform import _vector_args
 
 
@@ -240,11 +240,18 @@ class Curve:
             raise ValueError("tube curve has no length")
         return Field("tube", 3, Tube(points, radius))
 
-    def sweep(self, profile: Field, *, tolerance=0.01, up=None, closed=False) -> Field:
-        """Sweep a 2D profile; up selects its initial local Y direction.
-
-        Near-reversals and closed paths requiring extra frame twist are rejected.
-        """
+    def sweep(
+        self,
+        profile: Field,
+        *,
+        tolerance=0.01,
+        up=None,
+        closed=False,
+        orientation="perpendicular",
+    ) -> Field:
+        """Sweep a 2D profile; see Field.sweep."""
         from .sweep import sweep
 
-        return sweep(profile, self, tolerance=tolerance, up=up, closed=closed)
+        return sweep(
+            profile, self, tolerance=tolerance, up=up, closed=closed, orientation=orientation
+        )

@@ -4,11 +4,12 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from dataclasses import dataclass
-from math import isfinite
+from math import cos, hypot, isfinite, pi, sin
 
 import numpy as np
 
-from .field_payloads import (
+from .material import validate_material_id
+from .nodes import (
     Box,
     Capsule,
     Custom,
@@ -23,6 +24,7 @@ from .field_payloads import (
     RadialPattern,
     Radius,
     Rectangle,
+    Revolve,
     Shell,
     Slice,
     SmoothUnion,
@@ -31,9 +33,8 @@ from .field_payloads import (
     WarpPayload,
     validate_field,
 )
-from .hit import Hit
-from .materials import validate_material_id
 from .plane import Plane, _cross
+from .sample import Sample
 from .transform import Placement, Transform, _vector_args
 from .warp import Warp
 
@@ -96,7 +97,7 @@ class Field:
         validate_field(self.kind, self.dim, self.data, self.children)
 
     def sample(self, points):
-        from .backend import evaluate_field
+        from .numpy_eval import evaluate_field
 
         return evaluate_field(self, points)
 
@@ -105,7 +106,7 @@ class Field:
         if point.shape != (self.dim,):
             raise ValueError(f"expected {self.dim} coordinates")
         distance, material = self.sample(point)
-        return Hit(float(distance), int(material))
+        return Sample(float(distance), int(material))
 
     def sdf(self, *point):
         return self(*point).distance
@@ -167,13 +168,13 @@ class Field:
             raise ValueError("place requires a Placement")
         return self.transform(placement.as_transform())
 
-    def warp(self, warp: Warp, *, bounds=None) -> Field:
-        """Apply a nonlinear map; supply enclosing bounds for bounds queries/rendering."""
+    def warp(self, warp: Warp, *, bounds) -> Field:
+        """Apply a nonlinear map, capped by finite bounds in the output coordinates."""
         from .bounds import as_aabb
 
         if not isinstance(warp, Warp) or warp.dim != self.dim:
             raise ValueError("field and warp dimensions must match")
-        bounds = None if bounds is None else as_aabb(bounds, self.dim)
+        bounds = as_aabb(bounds, self.dim)
         return Field("warp", self.dim, WarpPayload(warp, bounds), (self,))
 
     def slice(self, plane: Plane) -> Field:
@@ -244,12 +245,13 @@ class Field:
 
         Height and offset may be symbolic functions of (x, y). Heights are full
         thicknesses; nonpositive values have no interior. Callable fields need
-        enclosing 3D bounds for automatic bounds computation.
+        finite 3D bounds, which cap the resulting solid. Height and offset
+        coordinates clamp to those bounds outside their domain.
         Variable extrusion produces an implicit distance estimate.
         """
         if self.dim != 2:
             raise ValueError("only 2D sketches can be extruded")
-        from .operations import extrude
+        from .profiles import extrude
 
         return extrude(
             self,
@@ -260,28 +262,34 @@ class Field:
             offset_lipschitz=offset_lipschitz,
         )
 
-    def loft(self, stations: Iterable[LoftStation], *, axis="z") -> Field:
-        """Linearly interpolate one profile's offsets and scales at LoftStations.
+    def loft(self, stations: Iterable[LoftStation]) -> Field:
+        """Loft along Z, interpolating offsets and scales between LoftStations.
 
-        Returns a flat-capped implicit distance estimate;
-        transverse coordinates follow world axis order (Y/Z for axis='x').
+        Returns a flat-capped implicit distance estimate. Use .on(plane).loft for other axes.
         """
-        from .operations import loft
+        from .profiles import loft
 
-        return loft(self, stations, axis=axis)
+        return loft(self, stations)
 
-    def sweep(self, curve, *, tolerance=0.01, up=None, closed=False) -> Field:
-        """Sweep along a 2D/3D curve with transported frames and mitered joins.
+    def sweep(
+        self, curve, *, tolerance=0.01, up=None, closed=False, orientation="perpendicular"
+    ) -> Field:
+        """Sweep the profile origin along a 2D/3D curve.
 
-        Near-reversals and closed paths requiring extra frame twist are rejected.
+        Perpendicular sweeps transport the profile frame with mitered joins; up
+        selects its initial local Y. Near-reversals and closed paths requiring
+        extra frame twist are rejected. Parallel sweeps keep the profile in the
+        world XY orientation, and the path must never run along that plane.
         """
         from .sweep import sweep
 
-        return sweep(self, curve, tolerance=tolerance, up=up, closed=closed)
+        return sweep(
+            self, curve, tolerance=tolerance, up=up, closed=closed, orientation=orientation
+        )
 
-    def revolve(self, *, axis: str) -> Field:
-        """Revolve around the profile's X or Y axis on the default XY plane."""
-        return self.on(Plane.xy()).revolve(axis=axis)
+    def revolve(self, *, axis, angle: float = 2 * pi) -> Field:
+        """Revolve on the default XY plane; see Sketch.revolve."""
+        return self.on(Plane.xy()).revolve(axis=axis, angle=angle)
 
 
 @dataclass(frozen=True)
@@ -312,23 +320,87 @@ class Sketch:
             offset_lipschitz=offset_lipschitz,
         ).transform(self.plane.as_transform())
 
-    def revolve(self, *, axis: str) -> Field:
-        """Revolve around the plane's local X or Y axis through its origin."""
-        if axis not in ("x", "y"):
-            raise ValueError("revolution axis must be sketch-local x or y")
-        profile = self.profile
-        if axis == "x":
-            profile = profile.transform(Transform(((0.0, 1.0), (1.0, 0.0))))
-        profile = profile | profile.transform(Transform.scaling(-1, 1))
-        solid = Field("revolve", 3, Empty(), (profile,))
-        radial, axial = (
-            (self.plane.y_direction, self.plane.x_direction)
-            if axis == "x"
-            else (self.plane.x_direction, self.plane.y_direction)
+    def loft(self, stations: Iterable[LoftStation]) -> Field:
+        """Loft along the plane normal; station offsets and scales use profile-local (x, y)."""
+        return self.profile.loft(stations).place(self.plane.as_placement())
+
+    def sweep(self, curve, *, tolerance=0.01, closed=False, orientation="perpendicular") -> Field:
+        """Sweep the profile, in place, along a world curve starting on the plane.
+
+        The profile point at the curve start follows the path. Perpendicular
+        sweeps keep the profile square to the path, starting from the plane's
+        local Y; parallel sweeps keep the plane orientation.
+        """
+        from .sweep import sweep
+
+        return sweep(
+            self.profile,
+            curve,
+            tolerance=tolerance,
+            closed=closed,
+            orientation=orientation,
+            plane=self.plane,
         )
+
+    def revolve(self, *, axis, angle: float = 2 * pi) -> Field:
+        """Revolve the profile around a sketch-local axis, starting from the plane.
+
+        axis is "x", "y", or a line through two profile points ((x0, y0), (x1, y1)).
+        angle sweeps by the right-hand rule about the axis direction; negative
+        angles sweep the other way. Profile points on both sides of the axis revolve.
+        """
+        start, direction = _revolve_axis(axis)
+        angle = _number(angle)
+        if not 0 < abs(angle) <= 2 * pi:
+            raise ValueError("revolve angle must be nonzero and at most 2*pi in magnitude")
+        normal = (direction[1], -direction[0])
+        profile = self.profile
+        if (start, direction) != ((0.0, 0.0), (0.0, 1.0)):
+            profile = profile.transform(
+                Transform(
+                    (normal, direction),
+                    (-_dot2(normal, start), -_dot2(direction, start)),
+                )
+            )
+        plane = self.plane
+
+        def world(u, v):
+            return tuple(
+                u * x + v * y for x, y in zip(plane.x_direction, plane.y_direction, strict=False)
+            )
+
+        radial, axial = world(*normal), world(*direction)
         tangent = _cross(axial, radial)
+        if angle < 0:
+            c, s = cos(angle), sin(angle)
+            radial, tangent = (
+                tuple(c * r + s * t for r, t in zip(radial, tangent, strict=False)),
+                tuple(c * t - s * r for r, t in zip(radial, tangent, strict=False)),
+            )
+        origin = tuple(o + w for o, w in zip(plane.origin, world(*start), strict=False))
         rotation = tuple((radial[i], tangent[i], axial[i]) for i in range(3))
-        return solid.place(Placement(self.plane.origin, rotation_matrix=rotation))
+        solid = Field("revolve", 3, Revolve(min(abs(angle), 2 * pi)), (profile,))
+        return solid.place(Placement(origin, rotation_matrix=rotation))
+
+
+def _revolve_axis(axis):
+    if axis == "x":
+        return (0.0, 0.0), (1.0, 0.0)
+    if axis == "y":
+        return (0.0, 0.0), (0.0, 1.0)
+    try:
+        (x0, y0), (x1, y1) = axis
+        start, end = (_number(x0), _number(y0)), (_number(x1), _number(y1))
+    except (TypeError, ValueError) as exc:
+        raise ValueError('revolution axis must be "x", "y", or two 2D points') from exc
+    length = hypot(end[0] - start[0], end[1] - start[1])
+    if length == 0:
+        raise ValueError("revolution axis points must differ")
+    return start, ((end[0] - start[0]) / length, (end[1] - start[1]) / length)
+
+
+def _dot2(a, b):
+    return a[0] * b[0] + a[1] * b[1]
 
 
 def _same_dim(a: Field, b: Field) -> None:
@@ -368,7 +440,7 @@ def _field_reduce(kind: str, fields):
             return _binary(kind, balance(first, middle), balance(middle, last))
 
         return balance(0, len(leaves))
-    from .field import Scalar
+    from .expr import Scalar
 
     if not any(isinstance(field, Scalar) for field in fields):
         reducer = np.minimum if kind == "min" else np.maximum
@@ -376,8 +448,8 @@ def _field_reduce(kind: str, fields):
         for field in fields[1:]:
             result = reducer(result, field)
         return result
-    from .field import max_ as scalar_max
-    from .field import min_ as scalar_min
+    from .expr import max_ as scalar_max
+    from .expr import min_ as scalar_min
 
     return (scalar_min if kind == "min" else scalar_max)(*fields)
 
@@ -419,15 +491,19 @@ def polygon(points: Iterable[Iterable[float]]) -> Field:
     return Field("polygon", 2, Polygon(pts))
 
 
-def field_morph(sections, *, axis="z") -> Field:
-    """Blend fields at (position, 2D profile) sections into a flat-capped solid.
+def loft(*sketches: Sketch) -> Field:
+    """Blend sketch profiles on parallel planes, in order, into a flat-capped solid.
 
-    Linear interpolation at fixed transverse coordinates can erase interiors.
-    Returns an implicit distance estimate; transverse axes follow world order.
+    Profiles interpolate as distance fields, so disjoint neighbors can pinch or
+    vanish between sections. Returns an implicit distance estimate.
     """
-    from .operations import field_morph as make_field_morph
+    if len(sketches) == 1 and not isinstance(sketches[0], Sketch):
+        sketches = tuple(sketches[0])
+    if len(sketches) < 2 or not all(isinstance(sketch, Sketch) for sketch in sketches):
+        raise ValueError("loft needs at least two sketches")
+    from .profiles import loft_sketches
 
-    return make_field_morph(sections, axis=axis)
+    return loft_sketches(sketches)
 
 
 # Solid primitives use Z as their main axis and are centered at the origin.
@@ -458,11 +534,11 @@ def capsule(start: Iterable[float], end: Iterable[float], radius: float) -> Fiel
     return Field("capsule", 3, Capsule(a, b, _positive(radius)))
 
 
-def custom_sdf(fn, dim: int = 3, material_id: int = 0, *, lipschitz: float, bounds=None) -> Field:
-    """Capture a renderable scalar field; bounds enclose f <= 0 locally.
+def custom_sdf(fn, dim: int = 3, material_id: int = 0, *, lipschitz: float, bounds) -> Field:
+    """Capture a renderable scalar field capped by finite local bounds.
 
     The callable receives symbolic coordinates once. Its result must be a
-    scalar distance or Hit(distance, material), using field-aware math.
+    scalar distance or Sample(distance, material), using field-aware math.
     lipschitz promises |f(p)-f(q)| <= L*|p-q|; use 1 for a true SDF.
     """
     if dim not in (2, 3):
@@ -471,14 +547,14 @@ def custom_sdf(fn, dim: int = 3, material_id: int = 0, *, lipschitz: float, boun
         raise ValueError("custom SDF needs a callable")
     material_id = validate_material_id(material_id)
     from .bounds import as_aabb
-    from .field import as_scalar, compile_glsl, coordinates, to_glsl
+    from .expr import as_scalar, compile_glsl, coordinates, to_glsl
 
-    bounds = None if bounds is None else as_aabb(bounds, dim)
+    bounds = as_aabb(bounds, dim)
     lipschitz = _positive(lipschitz)
     try:
         value = fn(*coordinates()[:dim])
         distance, material = (
-            (value.distance, value.material) if isinstance(value, Hit) else (value, material_id)
+            (value.distance, value.material) if isinstance(value, Sample) else (value, material_id)
         )
         distance, material = as_scalar(distance), as_scalar(material)
         if distance.kind != "float" or material.kind != "float":
@@ -488,6 +564,6 @@ def custom_sdf(fn, dim: int = 3, material_id: int = 0, *, lipschitz: float, boun
     except Exception as exc:
         raise ValueError(
             "custom_sdf callable must return a renderable scalar field; "
-            "use symbolic coordinates and sdf_kernel.math operations"
+            "use symbolic coordinates and agent_sdf.math operations"
         ) from exc
     return Field("custom", dim, Custom(distance, material, bounds, lipschitz))

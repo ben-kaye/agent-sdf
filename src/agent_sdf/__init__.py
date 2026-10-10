@@ -1,10 +1,9 @@
 """Signed distance geometry lowered directly to GLSL."""
 
-from .anchor import AnchorPlane
 from .bounds import AABB
 from .bvh import BVHNode
-from .curves import Curve
-from .dsl import (
+from .curve import Curve
+from .field import (
     Field,
     LoftStation,
     Sketch,
@@ -13,7 +12,7 @@ from .dsl import (
     circle,
     custom_sdf,
     cylinder,
-    field_morph,
+    loft,
     max_,
     min_,
     polygon,
@@ -21,12 +20,12 @@ from .dsl import (
     sphere,
     torus,
 )
-from .hit import Hit
-from .materials import Material
+from .material import Material
 from .model import Assembly, Instance, Part, Scene
-from .plane import Plane
+from .plane import AnchorPlane, Plane
 from .query import SurfaceHit, distance_between, pick, ray_cast
 from .renderer import render
+from .sample import Sample
 from .section import Contour, Section, section
 from .transform import Placement, Transform
 from .warp import Warp
@@ -38,7 +37,7 @@ __all__ = [
     "BVHNode",
     "Contour",
     "Curve",
-    "Hit",
+    "Sample",
     "LoftStation",
     "Instance",
     "Material",
@@ -58,7 +57,7 @@ __all__ = [
     "custom_sdf",
     "cylinder",
     "distance_between",
-    "field_morph",
+    "loft",
     "max_",
     "min_",
     "polygon",

@@ -2,9 +2,13 @@
 
 import math
 
-from sdf_kernel import (
-    Model,
+from agent_sdf import (
+    Assembly,
+    LoftStation,
+    Material,
+    Part,
     Plane,
+    Scene,
     Transform,
     box,
     capsule,
@@ -15,7 +19,7 @@ from sdf_kernel import (
     polygon,
     sphere,
 )
-from sdf_kernel import math as field_math
+from agent_sdf import math as field_math
 
 
 def block(x, y, z, hx, hy, hz, radius=0):
@@ -31,21 +35,21 @@ def xz_polygon(points, thickness, y=0):
 
 
 def ellipse_loft(stations):
-    return circle(1).loft(stations, axis="x")
+    return circle(1).on(Plane.yz()).loft(stations)
 
 
 FUSELAGE = (
-    (-8.55, 0, 0.12, 0.38, 0.41),
-    (-7.4, 0, 0.12, 0.78, 0.58),
-    (-5.6, 0, 0.10, 1.24, 0.70),
-    (-3.6, 0, 0.16, 1.38, 0.75),
-    (-1.1, 0, 0.20, 1.28, 0.78),
-    (1.5, 0, 0.25, 1.04, 0.68),
-    (3.7, 0, 0.24, 0.78, 0.53),
-    (5.3, 0, 0.20, 0.56, 0.41),
-    (7.1, 0, 0.12, 0.37, 0.28),
-    (8.7, 0, 0.08, 0.12, 0.12),
-    (9.45, 0, 0.06, 0.013, 0.016),
+    LoftStation(-8.55, offset=(0, 0.12), scale=(0.38, 0.41)),
+    LoftStation(-7.4, offset=(0, 0.12), scale=(0.78, 0.58)),
+    LoftStation(-5.6, offset=(0, 0.10), scale=(1.24, 0.70)),
+    LoftStation(-3.6, offset=(0, 0.16), scale=(1.38, 0.75)),
+    LoftStation(-1.1, offset=(0, 0.20), scale=(1.28, 0.78)),
+    LoftStation(1.5, offset=(0, 0.25), scale=(1.04, 0.68)),
+    LoftStation(3.7, offset=(0, 0.24), scale=(0.78, 0.53)),
+    LoftStation(5.3, offset=(0, 0.20), scale=(0.56, 0.41)),
+    LoftStation(7.1, offset=(0, 0.12), scale=(0.37, 0.28)),
+    LoftStation(8.7, offset=(0, 0.08), scale=(0.12, 0.12)),
+    LoftStation(9.45, offset=(0, 0.06), scale=(0.013, 0.016)),
 )
 WING = ((2.0, 1.05), (1.15, 1.95), (-1.6, 6.65), (-2.55, 6.65), (-3.55, 3.25), (-4.55, 1.45))
 LEX = ((4.42, 0.55), (3.54, 0.83), (1.55, 2.17), (1.13, 2.03), (1.88, 1.01))
@@ -55,12 +59,12 @@ FIN = ((-5.65, 0.40), (-7.10, 2.72), (-8.10, 2.93), (-8.34, 2.72), (-7.75, 0.45)
 RUDDER = ((-7.77, 0.65), (-7.15, 2.57), (-8.10, 2.76), (-8.31, 2.61))
 VENTRAL_FIN = ((-6.10, -0.25), (-7.28, -1.32), (-8.13, -1.29), (-7.76, -0.31))
 CANOPY = (
-    (1.50, 0, 0.80, 0.52, 0.12),
-    (1.83, 0, 1.04, 0.69, 0.34),
-    (2.55, 0, 1.16, 0.72, 0.48),
-    (3.62, 0, 1.19, 0.65, 0.48),
-    (4.60, 0, 1.04, 0.50, 0.33),
-    (5.45, 0, 0.76, 0.13, 0.08),
+    LoftStation(1.50, offset=(0, 0.80), scale=(0.52, 0.12)),
+    LoftStation(1.83, offset=(0, 1.04), scale=(0.69, 0.34)),
+    LoftStation(2.55, offset=(0, 1.16), scale=(0.72, 0.48)),
+    LoftStation(3.62, offset=(0, 1.19), scale=(0.65, 0.48)),
+    LoftStation(4.60, offset=(0, 1.04), scale=(0.50, 0.33)),
+    LoftStation(5.45, offset=(0, 0.76), scale=(0.13, 0.08)),
 )
 
 
@@ -106,7 +110,7 @@ def lifting_surfaces():
                 wing_height,
                 offset=wing_offset,
                 bounds=((-4.6, -6.7, -0.5), (2.1, 6.7, 0.5)),
-                height_lipschitz=128,
+                height_lipschitz=8,
                 offset_lipschitz=0.034,
             )
         )
@@ -123,7 +127,7 @@ def lifting_surfaces():
                 lambda x, y: 0.62 * wing_height(x, y),
                 offset=wing_offset,
                 bounds=((-3.6, -6.7, -0.5), (-2.1, 6.7, 0.5)),
-                height_lipschitz=80,
+                height_lipschitz=8,
                 offset_lipschitz=0.034,
             )
         )
@@ -181,11 +185,11 @@ def engines():
         *(
             ellipse_loft(
                 (
-                    (-8.72, side * 1.04, -0.06, 0.47, 0.43),
-                    (-7.6, side * 1.04, -0.05, 0.58, 0.53),
-                    (-5.5, side * 1.04, -0.03, 0.64, 0.57),
-                    (-3.0, side * 1.03, 0.03, 0.64, 0.55),
-                    (-1.55, side * 1.03, 0.08, 0.55, 0.45),
+                    LoftStation(-8.72, offset=(side * 1.04, -0.06), scale=(0.47, 0.43)),
+                    LoftStation(-7.6, offset=(side * 1.04, -0.05), scale=(0.58, 0.53)),
+                    LoftStation(-5.5, offset=(side * 1.04, -0.03), scale=(0.64, 0.57)),
+                    LoftStation(-3.0, offset=(side * 1.03, 0.03), scale=(0.64, 0.55)),
+                    LoftStation(-1.55, offset=(side * 1.03, 0.08), scale=(0.55, 0.45)),
                 )
             )
             for side in (-1, 1)
@@ -210,7 +214,12 @@ def exhausts():
         outer = x_cylinder(-8.73, yc, -0.06, 0.43, 0.45)
         bore = x_cylinder(-8.88, yc, -0.06, 0.47, 0.325)
         throat = x_cylinder(-8.77, yc, -0.06, 0.025, 0.318)
-        cone = ellipse_loft(((-9.01, yc, -0.06, 0.02, 0.02), (-8.74, yc, -0.06, 0.19, 0.19)))
+        cone = ellipse_loft(
+            (
+                LoftStation(-9.01, offset=(yc, -0.06), scale=(0.02, 0.02)),
+                LoftStation(-8.74, offset=(yc, -0.06), scale=(0.19, 0.19)),
+            )
+        )
         parts.extend((outer - bore, throat, cone))
         for index in range(12):
             angle = 2 * math.pi * index / 12
@@ -220,14 +229,34 @@ def exhausts():
     return min_(*parts)
 
 
-def canopy_frames(glass):
-    bands = min_(
-        block(1.75, 0, 1.2, 0.045, 1, 1),
-        block(3.02, 0, 1.2, 0.026, 1, 1),
-        block(5.07, 0, 1.2, 0.035, 1, 1),
-    )
-    center = block(3.5, 0, 1.2, 3, 0.018, 1)
-    return glass.shell(0.044) & block(3.5, 0, 2.29, 3, 1, 1.5) & (bands | center)
+def canopy_frames():
+    def section(x):
+        for a, b in zip(CANOPY, CANOPY[1:], strict=False):
+            if x <= b.position:
+                t = (x - a.position) / (b.position - a.position)
+                center_z = a.offset[1] + t * (b.offset[1] - a.offset[1])
+                radius_y = a.scale[0] + t * (b.scale[0] - a.scale[0])
+                radius_z = a.scale[1] + t * (b.scale[1] - a.scale[1])
+                return center_z, radius_y, radius_z
+        raise ValueError("canopy frame lies outside the canopy")
+
+    frames = []
+    for x in (1.75, 3.02, 5.07):
+        center_z, radius_y, radius_z = section(x)
+        points = [
+            (
+                x,
+                (radius_y + 0.025) * math.cos(math.pi * i / 16),
+                center_z + (radius_z + 0.025) * math.sin(math.pi * i / 16),
+            )
+            for i in range(17)
+        ]
+        frames.extend(capsule(a, b, 0.024) for a, b in zip(points, points[1:], strict=False))
+    top = [
+        (station.position, 0, station.offset[1] + station.scale[1] + 0.025) for station in CANOPY
+    ]
+    frames.extend(capsule(a, b, 0.017) for a, b in zip(top, top[1:], strict=False))
+    return min_(*frames)
 
 
 def wing_hardpoints():
@@ -260,8 +289,8 @@ def weapons():
             stores.append(
                 ellipse_loft(
                     (
-                        (cx + 1.54, cy, -0.79, 0.125, 0.125),
-                        (cx + 2.18, cy, -0.79, 0.004, 0.004),
+                        LoftStation(cx + 1.54, offset=(cy, -0.79), scale=(0.125, 0.125)),
+                        LoftStation(cx + 2.18, offset=(cy, -0.79), scale=(0.004, 0.004)),
                     )
                 )
             )
@@ -280,7 +309,12 @@ def weapons():
             (
                 block(-2.10, cy, -0.26, 1.42, 0.065, 0.07),
                 x_cylinder(-2.18, cy, -0.38, 2.35, 0.085),
-                ellipse_loft(((-0.99, cy, -0.38, 0.085, 0.085), (-0.52, cy, -0.38, 0.004, 0.004))),
+                ellipse_loft(
+                    (
+                        LoftStation(-0.99, offset=(cy, -0.38), scale=(0.085, 0.085)),
+                        LoftStation(-0.52, offset=(cy, -0.38), scale=(0.004, 0.004)),
+                    )
+                ),
             )
         )
     return min_(*stores)
@@ -330,49 +364,48 @@ def rescue_markings():
     )
 
 
-MODEL = Model()
-airframe = MODEL.material("airframe", base_color="#929a9d", metallic=0.72, roughness=0.43)
-radome = MODEL.material("radome", base_color="#292e32", metallic=0.08, roughness=0.72)
-glass_id = MODEL.material("canopy", base_color="#263e4a", metallic=0.15, roughness=0.11)
-engine_id = MODEL.material("engine", base_color="#353839", metallic=0.75, roughness=0.62)
-missile = MODEL.material("missile", base_color="#dedbd2", metallic=0.26, roughness=0.40)
-marking = MODEL.material("marking", base_color="#a84237", metallic=0.10, roughness=0.58)
-
-
-def attach(name, shape, material):
-    MODEL.define(name, shape.with_material(material))
-    MODEL.apply(name + "_attached", "min", name)
-
+airframe = Material("airframe", base_color="#929a9d", metallic=0.72, roughness=0.43)
+radome = Material("radome", base_color="#292e32", metallic=0.08, roughness=0.72)
+glass_material = Material("canopy", base_color="#263e4a", metallic=0.15, roughness=0.11)
+engine_material = Material("engine", base_color="#353839", metallic=0.75, roughness=0.62)
+missile = Material("missile", base_color="#dedbd2", metallic=0.26, roughness=0.40)
+marking = Material("marking", base_color="#a84237", metallic=0.10, roughness=0.58)
+MODEL = Assembly()
 
 fuselage = ellipse_loft(FUSELAGE)
-MODEL.start("lofted_fuselage", fuselage.with_material(airframe))
-attach("radome", fuselage & block(8.95, 0, 0, 1.5, 2, 2), radome)
-attach("swept_wings_and_tailplanes", lifting_surfaces(), airframe)
-attach("canted_vertical_tails", vertical_tails(), airframe)
-attach(
-    "ventral_stability_fins",
-    min_(*(xz_polygon(VENTRAL_FIN, 0.17, side * 1.30) for side in (-1, 1))),
-    airframe,
+intake_duct_cutters = min_(
+    *(block(-0.12, side * 1.57, -0.16, 1.05, 0.33, 0.29) for side in (-1, 1))
 )
-attach("twin_engine_nacelles", engines(), airframe)
-attach("intake_fairings", inlet_housings(), airframe)
-MODEL.define(
-    "intake_duct_cutters",
-    min_(*(block(-0.12, side * 1.57, -0.16, 1.05, 0.33, 0.29) for side in (-1, 1))),
-)
-MODEL.apply("open_intake_ducts", "subtract", "intake_duct_cutters")
-attach(
+# The openings cut the airframe already present at this stage. Later details
+# are separate parts and remain visible inside and around the ducts.
+for name, shape, material in (
+    ("lofted_fuselage", fuselage, airframe),
+    ("radome", fuselage & block(8.95, 0, 0, 1.5, 2, 2), radome),
+    ("swept_wings_and_tailplanes", lifting_surfaces(), airframe),
+    ("canted_vertical_tails", vertical_tails(), airframe),
+    (
+        "ventral_stability_fins",
+        min_(*(xz_polygon(VENTRAL_FIN, 0.17, side * 1.30) for side in (-1, 1))),
+        airframe,
+    ),
+    ("twin_engine_nacelles", engines(), airframe),
+    ("intake_fairings", inlet_housings(), airframe),
+):
+    MODEL.add(name, Part(shape - intake_duct_cutters, material=material))
+MODEL.add(
     "shadowed_intake_depth",
-    min_(*(block(-0.62, side * 1.57, -0.16, 0.07, 0.32, 0.28) for side in (-1, 1))),
-    radome,
+    Part(
+        min_(*(block(-0.62, side * 1.57, -0.16, 0.07, 0.32, 0.28) for side in (-1, 1))),
+        material=radome,
+    ),
 )
-attach("afterburner_nozzles", exhausts(), engine_id)
+MODEL.add("afterburner_nozzles", Part(exhausts(), material=engine_material))
 glass = ellipse_loft(CANOPY)
-attach("smoked_canopy", glass & block(3.5, 0, 2.30, 3, 1, 1.5), glass_id)
-attach("canopy_structural_frames", canopy_frames(glass), radome)
-attach("underwing_pylons", wing_hardpoints(), airframe)
-attach("wing_stores_and_tip_rails", weapons(), missile)
-attach("engraved_seams_and_details", surface_detail(), radome)
-attach("sensors_antennae_and_lights", sensors_and_antennas(), radome)
-attach("rescue_and_service_markings", rescue_markings(), marking)
-SCENE = MODEL.scene()
+MODEL.add("smoked_canopy", Part(glass & block(3.5, 0, 2.30, 3, 1, 1.5), material=glass_material))
+MODEL.add("canopy_structural_frames", Part(canopy_frames(), material=radome))
+MODEL.add("underwing_pylons", Part(wing_hardpoints(), material=airframe))
+MODEL.add("wing_stores_and_tip_rails", Part(weapons(), material=missile))
+MODEL.add("engraved_seams_and_details", Part(surface_detail(), material=radome))
+MODEL.add("sensors_antennae_and_lights", Part(sensors_and_antennas(), material=radome))
+MODEL.add("rescue_and_service_markings", Part(rescue_markings(), material=marking))
+SCENE = Scene(fighter=MODEL)
