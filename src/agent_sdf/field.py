@@ -345,11 +345,12 @@ class Sketch:
     def revolve(self, *, axis, angle: float = 2 * pi) -> Field:
         """Revolve the profile around a sketch-local axis, starting from the plane.
 
-        axis is "x", "y", or a line through two profile points ((x0, y0), (x1, y1)).
-        angle sweeps by the right-hand rule about the axis direction; negative
-        angles sweep the other way. Profile points on both sides of the axis revolve.
+        axis is "x", "y", or a line through two points: sketch-local (x, y) or
+        world (x, y, z) points lying on the plane. angle sweeps by the right-hand
+        rule about the axis direction; negative angles sweep the other way.
+        Profile points on both sides of the axis revolve.
         """
-        start, direction = _revolve_axis(axis)
+        start, direction = _revolve_axis(axis, self.plane)
         angle = _number(angle)
         if not 0 < abs(angle) <= 2 * pi:
             raise ValueError("revolve angle must be nonzero and at most 2*pi in magnitude")
@@ -366,7 +367,7 @@ class Sketch:
 
         def world(u, v):
             return tuple(
-                u * x + v * y for x, y in zip(plane.x_direction, plane.y_direction, strict=False)
+                u * x + v * y for x, y in zip(plane.x_direction, plane.y_direction, strict=True)
             )
 
         radial, axial = world(*normal), world(*direction)
@@ -374,25 +375,35 @@ class Sketch:
         if angle < 0:
             c, s = cos(angle), sin(angle)
             radial, tangent = (
-                tuple(c * r + s * t for r, t in zip(radial, tangent, strict=False)),
-                tuple(c * t - s * r for r, t in zip(radial, tangent, strict=False)),
+                tuple(c * r + s * t for r, t in zip(radial, tangent, strict=True)),
+                tuple(c * t - s * r for r, t in zip(radial, tangent, strict=True)),
             )
-        origin = tuple(o + w for o, w in zip(plane.origin, world(*start), strict=False))
+        origin = tuple(o + w for o, w in zip(plane.origin, world(*start), strict=True))
         rotation = tuple((radial[i], tangent[i], axial[i]) for i in range(3))
         solid = Field("revolve", 3, Revolve(min(abs(angle), 2 * pi)), (profile,))
         return solid.place(Placement(origin, rotation_matrix=rotation))
 
 
-def _revolve_axis(axis):
+def _revolve_axis(axis, plane):
     if axis == "x":
         return (0.0, 0.0), (1.0, 0.0)
     if axis == "y":
         return (0.0, 0.0), (0.0, 1.0)
     try:
-        (x0, y0), (x1, y1) = axis
-        start, end = (_number(x0), _number(y0)), (_number(x1), _number(y1))
+        start, end = axis
+        points = tuple(tuple(_number(value) for value in point) for point in (start, end))
     except (TypeError, ValueError) as exc:
-        raise ValueError('revolution axis must be "x", "y", or two 2D points') from exc
+        raise ValueError('revolution axis must be "x", "y", or two 2D or 3D points') from exc
+    if {len(point) for point in points} == {2}:
+        start, end = points
+    elif {len(point) for point in points} == {3}:
+        scale = max(1.0, *map(abs, plane.origin), *(abs(v) for point in points for v in point))
+        try:
+            start, end = (plane.world_to_local(point, tolerance=1e-9 * scale) for point in points)
+        except ValueError as exc:
+            raise ValueError("world revolution axis must lie on the sketch plane") from exc
+    else:
+        raise ValueError('revolution axis must be "x", "y", or two 2D or 3D points')
     length = hypot(end[0] - start[0], end[1] - start[1])
     if length == 0:
         raise ValueError("revolution axis points must differ")

@@ -19,6 +19,13 @@ def _bounds_distance(p, bounds):
     return _round_box(p - (lower / 2 + upper / 2), upper / 2 - lower / 2, 0)
 
 
+def _clip(distance, p, boxes):
+    """Cap a distance estimate below by the distance to boxes enclosing its zero set."""
+    if boxes is None:
+        return distance
+    return np.maximum(distance, np.min([_bounds_distance(p, box) for box in boxes], axis=0))
+
+
 def _segment(p, a, b):
     a, b = np.asarray(a), np.asarray(b)
     edge = b - a
@@ -321,11 +328,14 @@ def evaluate_field(field, points):
             distance, material = evaluate_operation(node, q, evaluate)
             if kind == "variable_extrude":
                 distance = np.maximum(distance, _bounds_distance(q, data.bounds))
+            else:
+                distance = _clip(distance, q, data.bounds)
             return distance, material
         if kind == "profile_sweep":
             from .sweep import evaluate_sweep
 
-            return evaluate_sweep(node, q, evaluate)
+            distance, material = evaluate_sweep(node, q, evaluate)
+            return _clip(distance, q, data.bounds), material
         if kind == "extrude":
             distance, material = evaluate(child, q[..., :2])
             offset = data.offset

@@ -54,9 +54,9 @@ World axes are right-handed with Z up. Cameras look along local −Z with local 
 | Combine | `a \| b` union, `a & b` intersection, `a - b` difference, `a ^ b` symmetric difference, `a.smooth_union(b, radius)`. Operands must have the same dimension. |
 | Transform | `.translate(*offset)`, `.rotate(angle, axis="z")`, `.scale(factor)`, `.transform(Transform(...))`, `.place(Placement(...))` |
 | Modify | `.offset(amount)`, `.shell(thickness)`, `.linear_pattern(count, *step)`, `.radial_pattern(count, axis="z")`, `.with_material(id)`, `.named(name)` |
-| Make solids | On a 2D field: `.extrude(height, offset=0)`, `.revolve(axis="x")` or `axis="y"`, `.loft([LoftStation(position, offset=(u, v), scale=s), ...])`, `.sweep(curve)`. `loft(*sketches)` blends different sketches on parallel planes, in order. |
-| Curves | `Curve(*start).line_to(*end).quad_to(control, end).arc_to(center, end)`. Use `.close()` for a 2D profile or `.tube(radius)` for a 3D tube; 3D arcs require `normal`. |
-| Planes | `Plane.xy(z=0)`, `.xz(y=0)`, `.yz(x=0)`, or `Plane(origin, normal, x_direction=...)`. `profile.on(plane)` creates a `Sketch` for extrusion, revolution, `.loft(stations)`, or `loft(*sketches)`. `AnchorPlane` adds named points: `.define_point(name, point)`, `.point(name, space="world")`. |
+| Make solids | On a 2D field: `.extrude(height, offset=0)`, `.revolve(axis="x", angle=2π)` or `axis="y"`, `.loft([LoftStation(position, offset=(u, v), scale=s), ...])`, `.sweep(curve, up=..., closed=False, orientation="perpendicular")`. `loft(*sketches)` blends different sketches on parallel planes, in order. |
+| Curves | `Curve(*start).line_to(*end).quad_to(control, end).arc_to(center, end)`. Use `.close()` for a 2D profile, `.tube(radius)` for a 3D tube, or `.sweep(profile)`; 3D arcs require `normal`. |
+| Planes | `Plane.xy(z=0)`, `.xz(y=0)`, `.yz(x=0)`, or `Plane(origin, normal, x_direction=...)`. `profile.on(plane)` creates a `Sketch` for extrusion, revolution, sweeping, `.loft(stations)`, or `loft(*sketches)`. `AnchorPlane` adds named points: `.define_point(name, point)`, `.point(name, space="world")`. |
 
 Placement, shells, radial patterns, and materials require 3D fields. `Transform` is affine; `Placement` is rigid. Compose either with `.then(other)`.
 
@@ -66,19 +66,19 @@ Nonlinear transforms use `Warp(dim, inverse, lipschitz=...)` and `.warp(warp, bo
 
 ## Assemblies and inspection
 
-Define reusable geometry with `Part(field, material=Material(name, base_color=...), datums=...)`. Place it with `.at(Placement(...))`, then compose with `Assembly().add(name, part_or_instance)` or `Scene(...named_components)`. Assemblies can be nested; `.datum("component/name")` resolves exported points, planes, or placements. `.to_field()` unions the placed fields. See the [assembly example](examples/assembly.py).
+Define reusable geometry with `Part(field, material=Material(name, base_color=...), datums=...)`, or `materials={id: Material(...)}` for several material IDs. Place it with `.at(Placement(...))`, then compose with `Assembly().add(name, part_or_instance)` or `Scene(...named_components)`. Assemblies can be nested; `.datum("component/name")` resolves exported points, planes, or placements. `.to_field()` unions the placed fields. See the [assembly example](examples/assembly.py).
 
 Evaluate with `field(*point)` for a `Sample`, `.sdf(*point)` for distance, or `.sample(points)` for distance/material arrays. Inspect with `.bounds()`, `.extents()`, and `.bvh()`.
 
-`ray_cast(...)` and `pick(...)` return a `SurfaceHit` or `None`; `distance_between(a, b)` measures 3D distance. `section(object, plane, bounds)` returns world-space contours; `field.slice(plane).contours(bounds)` returns local 2D contours.
+`ray_cast(...)` and `pick(...)` (also methods on fields and models) return a `SurfaceHit` or `None`; `distance_between(a, b)` measures 3D distance. `section(object, plane, bounds)` returns world-space contours; `field.slice(plane).contours(bounds)` returns local 2D contours.
 
 ## Rendering
 
-`render(scene, width, height, eye, target, ...)` returns a Pillow image. Use `fov=0, camera_size=2` for orthographic projection.
+`render(scene, width, height, eye, target, ...)` returns a Pillow image. Use `fov=0, camera_size=2` for orthographic projection. For raw material IDs, pass `materials=` or define `MATERIALS` in the scene as `{name: {"id": ..., "base_color": ...}}`.
 
 CLI tools: `sdf-view` and `sdf-render`. Run each with `--help` for options. Both accept `--eye X Y Z`, `--target X Y Z`, `--fov`, and `--bvh/--no-bvh`.
 
-`sdf-render` renders `--view` names, else the scene's `VIEWS`, else `iso`. `VIEWS` maps names to camera dicts (`eye`, `target`, `fov`, `far`, `camera_size`, `up`, `orientation`); `--views FILE` reads the same from JSON or a previous render's metadata. Use `--final` for antialiased output.
+`sdf-render` renders `--view` names, else the scene's `VIEWS`, else `iso`. `VIEWS` maps names to camera dicts (`eye`, `target`, `fov`, `far`, `camera_size`, `up`, `orientation`); `--views FILE` reads the same from JSON or a previous render's metadata. Use `--final` for antialiased output, or pick `--aa` (`none`, `fxaa`, `smaa`, `ssaa`, `adaptive`). `sdf-view --bounds` supplies bounds for fields without analytic ones.
 
 Browse the [examples](examples) for complete models.
 

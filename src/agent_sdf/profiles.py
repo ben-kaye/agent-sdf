@@ -13,6 +13,28 @@ def _positions(values, operation):
         raise ValueError(f"{operation} needs at least two strictly increasing station positions")
 
 
+def _section_boxes(sections, axes):
+    """Enclose each station segment's zero set from (position, planar box) pairs."""
+    from .bounds import AABB, clip_boxes
+
+    axis, transverse = axes
+
+    def lift(low, high, planar):
+        lower, upper = [0.0] * 3, [0.0] * 3
+        lower[axis], upper[axis] = low, high
+        for i, target in enumerate(transverse):
+            lower[target], upper[target] = planar.minimum[i], planar.maximum[i]
+        return AABB(tuple(lower), tuple(upper))
+
+    return clip_boxes(
+        (
+            lift(a, b, first.union(second))
+            for (a, first), (b, second) in zip(sections, sections[1:], strict=False)
+        ),
+        4,
+    )
+
+
 def field_morph(sections) -> Field:
     """Interpolate 2D signed fields at (position, profile) sections along Z, with flat caps."""
     sections = tuple(sections)
@@ -23,7 +45,16 @@ def field_morph(sections) -> Field:
         positions.append(_number(position))
         profiles.append(profile)
     _positions(positions, "field_morph")
-    return Field("field_morph", 3, FieldMorph(tuple(positions), _Z_AXES), tuple(profiles))
+    from .bounds import _analytic
+
+    bounds = _section_boxes(
+        [
+            (position, _analytic(profile))
+            for position, profile in zip(positions, profiles, strict=True)
+        ],
+        _Z_AXES,
+    )
+    return Field("field_morph", 3, FieldMorph(tuple(positions), _Z_AXES, bounds), tuple(profiles))
 
 
 def loft_sketches(sketches) -> Field:
@@ -69,7 +100,23 @@ def loft(profile, stations) -> Field:
         raise ValueError("loft stations must be LoftStation values")
     _positions([station.position for station in stations], "loft")
     stations = tuple((station.position, *station.offset, *station.scale) for station in stations)
-    return Field("loft", 3, Loft(stations, _Z_AXES), (profile,))
+    from .bounds import AABB, _analytic
+
+    base = _analytic(profile)
+    bounds = _section_boxes(
+        [
+            (
+                position,
+                AABB(
+                    (ox + sx * base.minimum[0], oy + sy * base.minimum[1]),
+                    (ox + sx * base.maximum[0], oy + sy * base.maximum[1]),
+                ),
+            )
+            for position, ox, oy, sx, sy in stations
+        ],
+        _Z_AXES,
+    )
+    return Field("loft", 3, Loft(stations, _Z_AXES, bounds), (profile,))
 
 
 def extrude(
@@ -191,4 +238,6 @@ def operation_bounds(node, level, analytic):
     lower[axis], upper[axis] = low - padding, high + padding
     for i, target in enumerate(transverse):
         lower[target], upper[target] = planar.minimum[i], planar.maximum[i]
-    return AABB(tuple(lower), tuple(upper))
+    from .bounds import clip_bounds
+
+    return clip_bounds(AABB(tuple(lower), tuple(upper)), node.data.bounds, padding)

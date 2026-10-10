@@ -122,11 +122,14 @@ class VariableExtrude(NamedTuple):
 class FieldMorph(NamedTuple):
     stations: tuple[float, ...]
     axes: tuple[int, tuple[int, int]]
+    # Boxes enclosing the zero set; the field is clipped to their distance.
+    bounds: tuple[Any, ...] | None = None
 
 
 class Loft(NamedTuple):
     stations: tuple[tuple[float, float, float, float, float], ...]
     axes: tuple[int, tuple[int, int]]
+    bounds: tuple[Any, ...] | None = None
 
 
 class Revolve(NamedTuple):
@@ -139,6 +142,7 @@ class Sweep(NamedTuple):
     tolerance: float
     closed: bool
     orientation: str
+    bounds: tuple[Any, ...] | None = None
 
 
 Payload = (

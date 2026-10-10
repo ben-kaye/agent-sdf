@@ -2,7 +2,7 @@
 
 from collections import namedtuple
 from itertools import product
-from math import cos, hypot, inf, isfinite, pi, sin
+from math import cos, hypot, inf, isfinite, pi, prod, sin
 
 
 def _coordinate(value):
@@ -83,6 +83,40 @@ def as_aabb(value, dim):
 def _points_bounds(points):
     axes = tuple(zip(*points, strict=True))
     return AABB(tuple(min(axis) for axis in axes), tuple(max(axis) for axis in axes))
+
+
+def clip_boxes(boxes, limit):
+    """Merge boxes enclosing a zero set to at most limit, padded for float32 clipping.
+
+    Returns None when any box is empty or unbounded, leaving the field unclipped.
+    """
+    boxes = list(boxes)
+    if not boxes or any(
+        box.is_empty or not all(isfinite(v) for v in box.minimum + box.maximum) for box in boxes
+    ):
+        return None
+    while len(boxes) > limit:
+        merged = [a.union(b) for a, b in zip(boxes, boxes[1:], strict=False)]
+        growth = [
+            prod(m.extents) - prod(a.extents) - prod(b.extents)
+            for m, a, b in zip(merged, boxes, boxes[1:], strict=False)
+        ]
+        i = growth.index(min(growth))
+        boxes[i : i + 2] = [merged[i]]
+    return tuple(
+        box.expanded(1e-6 * (1 + max(map(abs, box.minimum + box.maximum)))) for box in boxes
+    )
+
+
+def clip_bounds(box, clip, padding):
+    """Intersect a sublevel bound with the enclosure of a field's clip boxes."""
+    if clip is None:
+        return box
+    enclosure = clip[0]
+    for item in clip[1:]:
+        enclosure = enclosure.union(item)
+    # The clip caps every sublevel set at its box distance.
+    return box.intersection(enclosure.expanded(padding))
 
 
 def _centered(half):

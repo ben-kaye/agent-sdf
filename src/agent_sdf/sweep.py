@@ -205,8 +205,11 @@ def sweep(
         frames = _transported(points, up, closed)
     else:
         frames = _parallel(points, x_axis, y_axis)
+    from .bounds import _analytic, clip_boxes
+
     data = Sweep(points, frames, tolerance, closed, orientation)
-    return Field("profile_sweep", 3, data, (profile,))
+    bounds = clip_boxes(_span_boxes(_spans(data), _analytic(profile), 0.0), 8)
+    return Field("profile_sweep", 3, data._replace(bounds=bounds), (profile,))
 
 
 def _spans(data):
@@ -284,20 +287,14 @@ def evaluate_sweep(node, q, evaluate):
     return minimum, chosen_material
 
 
-def sweep_bounds(node, level, analytic):
-    """Conservative bounds for the sweep evaluator's sublevel set."""
+def _span_boxes(spans, profile_box, padding):
+    """Bound each capped span's sublevel set for a profile sublevel box."""
     from .bounds import AABB
 
-    spans = _spans(node.data)
-    padding = max(0.0, level)
-    profile_box = analytic(node.children[0], padding / min(span.scale for span in spans))
-    if profile_box.is_empty:
-        return AABB((float("inf"),) * 3, (-float("inf"),) * 3)
-    if not all(isfinite(x) for x in profile_box.minimum + profile_box.maximum):
-        return AABB((-float("inf"),) * 3, (float("inf"),) * 3)
-    lower = [float("inf")] * 3
-    upper = [-float("inf")] * 3
+    boxes = []
     for span in spans:
+        lower = [float("inf")] * 3
+        upper = [-float("inf")] * 3
         a, b = span.start, span.end
         x_axis, y_axis, direction = span.axes
         length = _dot(tuple(b[i] - a[i] for i in range(3)), direction)
@@ -315,4 +312,22 @@ def sweep_bounds(node, level, analytic):
                     coordinate = a[i] + radial[i] + s * direction[i]
                     lower[i] = min(lower[i], coordinate)
                     upper[i] = max(upper[i], coordinate)
-    return AABB(tuple(lower), tuple(upper))
+        boxes.append(AABB(tuple(lower), tuple(upper)))
+    return boxes
+
+
+def sweep_bounds(node, level, analytic):
+    """Conservative bounds for the sweep evaluator's sublevel set."""
+    from .bounds import AABB, clip_bounds
+
+    spans = _spans(node.data)
+    padding = max(0.0, level)
+    profile_box = analytic(node.children[0], padding / min(span.scale for span in spans))
+    if profile_box.is_empty:
+        return AABB((float("inf"),) * 3, (-float("inf"),) * 3)
+    if not all(isfinite(x) for x in profile_box.minimum + profile_box.maximum):
+        return AABB((-float("inf"),) * 3, (float("inf"),) * 3)
+    box = AABB((float("inf"),) * 3, (-float("inf"),) * 3)
+    for span_box in _span_boxes(spans, profile_box, padding):
+        box = box.union(span_box)
+    return clip_bounds(box, node.data.bounds, padding)
