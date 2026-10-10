@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from math import hypot, isfinite, pi
+from math import cos, hypot, isfinite, pi, sin
 
 import numpy as np
 
@@ -24,6 +24,12 @@ def _f(value):
 def _v(values):
     values = tuple(values)
     return f"vec{len(values)}(" + ", ".join(map(_f, values)) + ")"
+
+
+def _bounds_distance(bounds):
+    center = tuple(a / 2 + b / 2 for a, b in zip(bounds.minimum, bounds.maximum, strict=True))
+    half = tuple(b / 2 - a / 2 for a, b in zip(bounds.minimum, bounds.maximum, strict=True))
+    return f"sdBox{len(center)}(p - {_v(center)}, {_v(half)}, 0.0)"
 
 
 def _affine_point(matrix, translation, p):
@@ -227,6 +233,7 @@ def _lipschitz(node, box):
         result = node.data.lipschitz
         if result is None:
             raise ValueError("GLSL custom fields need a declared Lipschitz bound")
+        result = max(1.0, result)
     elif kind in ("min", "max", "subtract", "smooth_union"):
         # The smooth minimum's gradient is a convex combination of its inputs.
         result = max(children)
@@ -238,9 +245,10 @@ def _lipschitz(node, box):
         "material",
         "feature",
         "slice",
-        "warp",
     ):
         result = children[0]
+    elif kind == "warp":
+        result = max(1.0, children[0])
     elif kind == "transform":
         transform = node.data.transform
         inverse = np.asarray(transform.inverse_matrix)
@@ -252,19 +260,6 @@ def _lipschitz(node, box):
     elif kind == "revolve":
         result = children[0]
     elif kind == "variable_extrude":
-        if data.bounds is not None and any(
-            lo < declared_lo or hi > declared_hi
-            for lo, hi, declared_lo, declared_hi in zip(
-                box.minimum,
-                box.maximum,
-                data.bounds.minimum,
-                data.bounds.maximum,
-                strict=True,
-            )
-        ):
-            raise ValueError(
-                "GLSL variable extrusion gradient bounds must cover the enclosing operation"
-            )
         height = data.height_lipschitz if callable(data.height) else 0.0
         offset = data.offset_lipschitz if callable(data.offset) else 0.0
         if height is None or offset is None:
@@ -345,8 +340,10 @@ def _section_span_box(node, first, last):
 
 
 class _StepLowerer:
-    def __init__(self, raw_names):
+    def __init__(self, raw_names, *, combined=False, raw_steps=()):
         self.raw_names = raw_names
+        self.combined = combined
+        self.raw_steps = raw_steps
         self.names = {}
         self.functions = []
 
@@ -354,38 +351,58 @@ class _StepLowerer:
         key = id(node)
         if key in self.names:
             return self.names[key]
+        if key in self.raw_steps:
+            name = f"{'query' if self.combined else 'step'}{len(self.names)}"
+            self.names[key] = name
+            raw = self.raw_names[key]
+            body = (
+                f"float d = {raw}(p).x; return vec2(d);" if self.combined else f"return {raw}(p).x;"
+            )
+            result_type = "vec2" if self.combined else "float"
+            self.functions.append(
+                f"{result_type} {name}(vec{node.dim} p, vec{node.dim} ray) {{ {body} }}"
+            )
+            return name
         children = [self.lower(child) for child in node.children]
         if node.kind in ("material", "feature"):
             self.names[key] = children[0]
             return children[0]
-        name = f"step{len(self.names)}"
+        name = f"{'query' if self.combined else 'step'}{len(self.names)}"
         self.names[key] = name
         kind = node.kind
         raw = self.raw_names[key]
         dim = node.dim
         child = children[0] if children else None
-        if kind == "min":
-            body = f"return min({children[0]}(p, ray), {children[1]}(p, ray));"
-        elif kind == "max":
-            body = f"return max({children[0]}(p, ray), {children[1]}(p, ray));"
-        elif kind == "subtract":
-            body = f"return max({children[0]}(p, ray), -{children[1]}(p, ray));"
+        result_type = "vec2" if self.combined else "float"
+        if kind in ("min", "max", "subtract"):
+            operation = "min" if kind == "min" else "max"
+            sign = "-" if kind == "subtract" else ""
+            body = f"return {operation}({children[0]}(p, ray), {sign}{children[1]}(p, ray));"
+            if self.combined and kind != "subtract":
+                comparison = "<" if kind == "min" else ">"
+                body = (
+                    f"vec2 a = {children[0]}(p, ray), b = {children[1]}(p, ray); "
+                    f"return vec2(a.x {comparison} b.x ? a.x : b.x, {operation}(a.y, b.y));"
+                )
         elif kind == "linear_pattern":
+            sample = f"{child}(p - float(i) * {_v(node.data.step)}, ray)"
             body = (
-                f"float best = 1e30; for (int i = 0; i < {node.data.count}; ++i) {{ "
-                f"best = min(best, {child}(p - float(i) * {_v(node.data.step)}, ray)); "
-                "} return best;"
+                f"{result_type} best = {result_type}(1e30); "
+                f"for (int i = 0; i < {node.data.count}; ++i) {{ "
+                + self._pattern_sample(sample)
+                + "} return best;"
             )
         elif kind == "radial_pattern":
             axis = node.data.axis
             local = _inverse_rotation("p", "c", "s", axis)
             local_ray = _inverse_rotation("ray", "c", "s", axis)
             body = (
-                f"float best = 1e30; for (int i = 0; i < {node.data.count}; ++i) {{ "
+                f"{result_type} best = {result_type}(1e30); "
+                f"for (int i = 0; i < {node.data.count}; ++i) {{ "
                 f"float angle = float(i) * {_f(2 * pi / node.data.count)}; "
                 "float c = cos(angle), s = sin(angle); "
-                f"best = min(best, {child}({local}, {local_ray})); "
-                "} return best;"
+                + self._pattern_sample(f"{child}({local}, {local_ray})")
+                + "} return best;"
             )
         elif kind == "transform":
             transform = node.data.transform
@@ -401,19 +418,44 @@ class _StepLowerer:
                 for row in inverse
             )
             ray_map = f"vec{dim}(" + ", ".join(ray_terms) + ")"
-            body = (
-                f"vec{dim} localRay = {ray_map}; "
-                f"float speed = length(localRay); "
-                f"return {child}({mapped}, localRay / speed) / speed;"
-            )
-        elif kind == "loft":
-            body = self._section_step(node, raw)
+            body = f"vec{dim} localRay = {ray_map}; float speed = length(localRay); "
+            if self.combined:
+                body += (
+                    f"vec2 h = {child}({mapped}, localRay / speed); "
+                    f"return vec2(h.x * {_f(transform.distance_scale)}, h.y / speed);"
+                )
+            else:
+                body += f"return {child}({mapped}, localRay / speed) / speed;"
         else:
-            body = self._raw_step(node, raw)
-        self.functions.append(f"float {name}(vec{dim} p, vec{dim} ray) {{ {body} }}")
+            distance = "distance" if self.combined else None
+            advance = (
+                self._section_step(node, raw, distance)
+                if kind == "loft"
+                else self._raw_step(node, raw, distance)
+            )
+            if self.combined:
+                advance_name = f"{name}Advance"
+                self.functions.append(
+                    f"float {advance_name}(vec{dim} p, vec{dim} ray, float distance) {{ {advance} }}"
+                )
+                body = (
+                    f"float distance = {raw}(p).x; "
+                    f"return vec2(distance, {advance_name}(p, ray, distance));"
+                )
+            else:
+                body = advance
+        self.functions.append(f"{result_type} {name}(vec{dim} p, vec{dim} ray) {{ {body} }}")
         return name
 
-    def _section_step(self, node, raw):
+    def _pattern_sample(self, sample):
+        if self.combined:
+            return (
+                f"vec2 h = {sample}; if (h.x <= best.x) best.x = h.x; best.y = min(best.y, h.y); "
+            )
+        return f"best = min(best, {sample}); "
+
+    def _section_step(self, node, raw, distance=None):
+        distance = distance or f"{raw}(p).x"
         lines = ["float best = 1e30;"]
         spans = (
             span
@@ -436,7 +478,7 @@ class _StepLowerer:
                     "if (any(greaterThan(gap, vec3(0.0))))",
                     f"  candidate = rayBoxEntry(p, ray, {_v(box.minimum)}, {_v(box.maximum)}) + {_f(pad * 0.5)};",
                     "else",
-                    f"  candidate = {raw}(p).x / {_f(bound)};",
+                    f"  candidate = {distance} / {_f(bound)};",
                     "best = min(best, candidate);",
                     "}",
                 ]
@@ -444,9 +486,10 @@ class _StepLowerer:
         lines.append("return best;")
         return " ".join(lines)
 
-    def _raw_step(self, node, raw):
+    def _raw_step(self, node, raw, distance=None):
         from .bounds import AABB
 
+        distance = distance or f"{raw}(p).x"
         if node.kind in {
             "circle",
             "sphere",
@@ -459,7 +502,7 @@ class _StepLowerer:
             "curve_profile",
             "polygon",
         }:
-            return f"return {raw}(p).x;"
+            return f"return {distance};"
 
         box = node.bounds()
         if box.is_empty:
@@ -498,7 +541,7 @@ class _StepLowerer:
             )
         else:
             outside = ""
-        return f"{outside}return {raw}(p).x / {_f(max(1.0, bound))};"
+        return f"{outside}return {distance} / {_f(max(1.0, bound))};"
 
 
 _HELPERS = """
@@ -649,27 +692,129 @@ def feature_names(scene):
 
 
 class _Lowerer:
-    def __init__(self, feature_ids):
+    def __init__(self, feature_ids, *, geometry_only=False, accelerated=False):
+        from .glsl_acceleration import _ValueHierarchy
+
         self.functions = []
         self.names = {}
         self.feature_ids = feature_ids
+        self.geometry_only = geometry_only
+        self.accelerated = accelerated
+        self.hierarchy = _ValueHierarchy(self.functions, "distance" if geometry_only else "field")
+        self.raw_steps = set()
 
-    def lower(self, node):
+    def lower(self, node, *, union_child=False):
         key = id(node)
         if key in self.names:
             return self.names[key]
         if len(self.names) >= _MAX_NODES:
             raise ValueError(f"GLSL scene exceeds {_MAX_NODES} field nodes")
-        children = [self.lower(child) for child in node.children]
-        name = f"field{len(self.names)}"
+        children = [self.lower(child, union_child=node.kind == "min") for child in node.children]
+        if self.geometry_only and node.kind in ("material", "feature"):
+            self.names[key] = children[0]
+            if id(node.children[0]) in self.raw_steps:
+                self.raw_steps.add(key)
+            return children[0]
+        name = f"{'distance' if self.geometry_only else 'field'}{len(self.names)}"
         self.names[key] = name
         dim = node.dim
         ptype = f"vec{dim}"
-        lines = self._body(node, children)
+        lines = (
+            self._accelerated_body(node, children)
+            if self.accelerated and not (union_child and node.kind == "min")
+            else None
+        )
+        if lines is None:
+            lines = self._body(node, children)
+        if self.accelerated and self._raw_step(node):
+            self.raw_steps.add(key)
         self.functions.append(
             f"vec3 {name}({ptype} p) {{\n" + "\n".join(f"  {line}" for line in lines) + "\n}"
         )
         return name
+
+    def _raw_step(self, node):
+        if node.kind in {
+            "circle",
+            "sphere",
+            "rectangle",
+            "box",
+            "cylinder",
+            "torus",
+            "capsule",
+            "tube",
+            "curve_profile",
+            "polygon",
+        }:
+            return True
+        if node.kind in {
+            "min",
+            "max",
+            "subtract",
+            "linear_pattern",
+            "radial_pattern",
+            "material",
+            "feature",
+        }:
+            return all(id(child) in self.raw_steps for child in node.children)
+        if node.kind == "transform" and id(node.children[0]) in self.raw_steps:
+            stretch = np.linalg.svd(np.asarray(node.data.transform.matrix), compute_uv=False)
+            return bool(
+                np.allclose(stretch, node.data.transform.distance_scale, rtol=1e-10, atol=0)
+            )
+        return False
+
+    def _accelerated_body(self, node, children):
+        from .bounds import AABB, _affine, _points_bounds
+        from .glsl_acceleration import _certificate
+
+        if node.kind == "min":
+            components, pending = [], [node]
+            while pending:
+                current = pending.pop()
+                if current.kind == "min":
+                    pending.extend(reversed(current.children))
+                else:
+                    components.append(current)
+            entries = [(f"{self.names[id(field)]}(p)", _certificate(field)) for field in components]
+        elif node.kind in {"linear_pattern", "radial_pattern"}:
+            certificate = _certificate(node.children[0])
+            if certificate is None or not 4 <= node.data.count <= 256:
+                return None
+            box, scale = certificate
+            entries = []
+            for index in range(node.data.count):
+                if node.kind == "linear_pattern":
+                    delta = tuple(index * value for value in node.data.step)
+                    instance_box = AABB(
+                        tuple(a + d for a, d in zip(box.minimum, delta, strict=True)),
+                        tuple(b + d for b, d in zip(box.maximum, delta, strict=True)),
+                    )
+                    point = f"p - float({index}) * {_v(node.data.step)}"
+                else:
+                    angle = index * 2 * pi / node.data.count
+                    c, s = cos(angle), sin(angle)
+                    a, b = {"x": (1, 2), "y": (2, 0), "z": (0, 1)}[node.data.axis]
+                    rotation = np.eye(3)
+                    rotation[a, a] = rotation[b, b] = c
+                    rotation[a, b], rotation[b, a] = -s, s
+                    instance_box = _affine(box, rotation, (0, 0, 0))
+                    glsl_angle = f"(float({index}) * {_f(2 * pi / node.data.count)})"
+                    point = _inverse_rotation(
+                        "p", f"cos{glsl_angle}", f"sin{glsl_angle}", node.data.axis
+                    )
+                entries.append((f"{children[0]}({point})", (instance_box, scale)))
+        elif node.kind == "tube":
+            entries = [
+                (
+                    f"vec3(sdSegment3(p, {_v(a)}, {_v(b)}) - {_f(node.data.radius)}, 0.0, 0.0)",
+                    (_points_bounds((a, b)).expanded(node.data.radius), 1.0),
+                )
+                for a, b in zip(node.data.points, node.data.points[1:], strict=False)
+            ]
+        else:
+            return None
+        return self.hierarchy.lower(entries, node.dim)
 
     def _body(self, node, children):
         kind, data = node.kind, node.data
@@ -779,7 +924,7 @@ class _Lowerer:
             return [
                 *(f"float {axis} = p.{axis};" for axis in "xyz"[: node.dim]),
                 f"vec3 h = {child}({mapped});",
-                f"return vec3(h.x * {_f(data.warp.distance_scale)}, h.yz);",
+                f"return vec3(max(h.x * {_f(data.warp.distance_scale)}, {_bounds_distance(data.bounds)}), h.yz);",
             ]
         if kind == "offset":
             return [f"vec3 h = {child}(p);", f"return vec3(h.x - {_f(data.amount)}, h.yz);"]
@@ -815,10 +960,10 @@ class _Lowerer:
                     "GLSL extrusion callables must return symbolic scalar fields"
                 ) from exc
             return [
-                "float x = p.x;",
-                "float y = p.y;",
+                f"float x = clamp(p.x, {_f(data.bounds.minimum[0])}, {_f(data.bounds.maximum[0])});",
+                f"float y = clamp(p.y, {_f(data.bounds.minimum[1])}, {_f(data.bounds.maximum[1])});",
                 f"vec3 h = {child}(p.xy);",
-                f"return vec3(cap2(h.x, abs(p.z - ({offset_glsl})) - ({height_glsl}) * 0.5), h.yz);",
+                f"return vec3(max(cap2(h.x, abs(p.z - ({offset_glsl})) - ({height_glsl}) * 0.5), {_bounds_distance(data.bounds)}), h.yz);",
             ]
         if kind == "revolve":
             return [f"return {child}(vec2(length(p.xy), p.z));"]
@@ -832,10 +977,11 @@ class _Lowerer:
 
             coordinate_lines = [f"float {axis} = p.{axis};" for axis in "xyz"[: node.dim]]
             declarations, result = compile_field_glsl(data.distance)
+            material = "0.0" if self.geometry_only else to_glsl(data.material)
             return [
                 *coordinate_lines,
                 *declarations,
-                f"return vec3({result}, {to_glsl(data.material)}, 0.0);",
+                f"return vec3(max({result}, {_bounds_distance(data.bounds)}), {material}, 0.0);",
             ]
         raise ValueError(f"GLSL lowering does not support field kind '{kind}'")
 
@@ -972,7 +1118,7 @@ class _Lowerer:
         return lines
 
 
-def compile_glsl(scene, *, bvh=False):
+def compile_glsl(scene, *, bvh=True):
     """Return GLSL ES 3.00 for the union field and visible part surfaces.
 
     Set bvh to prune certified union components on the GPU.
@@ -1005,20 +1151,30 @@ def compile_glsl(scene, *, bvh=False):
     if bvh:
         bvh = _lipschitz(scene, box) <= 1.0
     names = feature_names(compiled)
-    compiler = _Lowerer({name: index for index, name in enumerate(names) if name is not None})
-    root = compiler.lower(scene)
-    stepper = _StepLowerer(compiler.names)
-    step_root = stepper.lower(scene)
+    compiler = _Lowerer(
+        {name: index for index, name in enumerate(names) if name is not None},
+        accelerated=traverse_parts,
+    )
     part_roots = tuple(compiler.lower(part.field) for part in compiled.parts)
-    part_steps = tuple(stepper.lower(part.field) for part in compiled.parts)
+    root = compiler.lower(scene)
+    geometry = _Lowerer({}, geometry_only=True, accelerated=traverse_parts)
+    for part in compiled.parts:
+        geometry.lower(part.field)
+    geometry.lower(scene)
+    stepper = _StepLowerer(geometry.names, raw_steps=geometry.raw_steps)
+    step_root = stepper.lower(scene)
+    query = _StepLowerer(geometry.names, combined=True, raw_steps=geometry.raw_steps)
+    part_queries = tuple(query.lower(part.field) for part in compiled.parts)
     step_source = [
+        *geometry.functions,
         *stepper.functions,
+        *query.functions,
         f"float mapStep(vec3 p, vec3 ray) {{ return {step_root}(p, ray); }}",
     ]
     if len(part_roots) == 1:
         surface_source = [
             f"vec3 mapSurface(vec3 p) {{ return {part_roots[0]}(p); }}",
-            f"float mapSurfaceStep(vec3 p, vec3 ray) {{ return abs({part_steps[0]}(p, ray)); }}",
+            f"vec2 mapSurfaceQuery(vec3 p, vec3 ray) {{ vec2 h = {part_queries[0]}(p, ray); return vec2(h.x, abs(h.y)); }}",
         ]
     else:
         surface_lines = [
@@ -1031,18 +1187,28 @@ def compile_glsl(scene, *, bvh=False):
             for name in part_roots[1:]
         )
         surface_lines.append("return best;")
-        step_lines = [f"float best = abs({part_steps[0]}(p, ray));"]
-        step_lines.extend(f"best = min(best, abs({name}(p, ray)));" for name in part_steps[1:])
-        step_lines.append("return best;")
+        query_lines = [
+            f"vec2 best = {part_queries[0]}(p, ray);",
+            "best.y = abs(best.y);",
+            "float distance = abs(best.x);",
+            "vec2 h;",
+        ]
+        query_lines.extend(
+            f"h = {name}(p, ray); if (abs(h.x) <= distance) {{ best.x = h.x; distance = abs(h.x); }} best.y = min(best.y, abs(h.y));"
+            for name in part_queries[1:]
+        )
+        query_lines.append("return best;")
         surface_source = [
             "vec3 mapSurface(vec3 p) {\n"
             + "\n".join(f"  {line}" for line in surface_lines)
             + "\n}",
-            "float mapSurfaceStep(vec3 p, vec3 ray) {\n"
-            + "\n".join(f"  {line}" for line in step_lines)
+            "vec2 mapSurfaceQuery(vec3 p, vec3 ray) {\n"
+            + "\n".join(f"  {line}" for line in query_lines)
             + "\n}",
         ]
-    surface_source.append(_surface_tracer(compiled, part_roots, part_steps, enabled=traverse_parts))
+    surface_source.append(
+        _surface_tracer(compiled, part_roots, part_queries, enabled=traverse_parts)
+    )
     if not bvh:
         return "\n".join(
             [

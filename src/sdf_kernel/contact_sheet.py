@@ -97,7 +97,12 @@ def main():
     parser.add_argument("--columns", type=int, help="number of columns (default: 3)")
     parser.add_argument("--gap", type=int, help="pixel gap (default: 12)")
     parser.add_argument("--final", action=argparse.BooleanOptionalAction, default=None)
-    parser.add_argument("--bvh", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument(
+        "--bvh",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="accelerate bounded geometry on GPU (default: saved setting or enabled)",
+    )
     parser.add_argument("--aa", choices=("auto", "none", "fxaa", "smaa", "ssaa", "adaptive"))
     args = parser.parse_args()
     source = args.source.resolve()
@@ -116,7 +121,7 @@ def main():
         columns = args.columns if args.columns is not None else saved.get("columns", 3)
         gap = args.gap if args.gap is not None else saved.get("gap", 12)
         final = args.final if args.final is not None else saved.get("quality") == "final"
-        bvh = args.bvh if args.bvh is not None else saved.get("bvh", False)
+        bvh = args.bvh if args.bvh is not None else saved.get("bvh", True)
         aa = args.aa if args.aa is not None else saved.get("aa", "auto")
         if not all(
             isinstance(value, int) and not isinstance(value, bool)

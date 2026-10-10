@@ -103,7 +103,12 @@ def main():
         help="conservative scene bounds for fields without analytic bounds",
     )
     parser.add_argument("--no-open", action="store_true")
-    parser.add_argument("--bvh", action="store_true", help="prune bounded union components on GPU")
+    parser.add_argument(
+        "--bvh",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="accelerate bounded geometry on GPU (default: enabled)",
+    )
     args = parser.parse_args()
     try:
         if not 1 <= args.port <= 65535:

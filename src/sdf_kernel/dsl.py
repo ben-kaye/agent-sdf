@@ -167,13 +167,13 @@ class Field:
             raise ValueError("place requires a Placement")
         return self.transform(placement.as_transform())
 
-    def warp(self, warp: Warp, *, bounds=None) -> Field:
-        """Apply a nonlinear map; supply enclosing bounds for bounds queries/rendering."""
+    def warp(self, warp: Warp, *, bounds) -> Field:
+        """Apply a nonlinear map, capped by finite bounds in the output coordinates."""
         from .bounds import as_aabb
 
         if not isinstance(warp, Warp) or warp.dim != self.dim:
             raise ValueError("field and warp dimensions must match")
-        bounds = None if bounds is None else as_aabb(bounds, self.dim)
+        bounds = as_aabb(bounds, self.dim)
         return Field("warp", self.dim, WarpPayload(warp, bounds), (self,))
 
     def slice(self, plane: Plane) -> Field:
@@ -244,7 +244,8 @@ class Field:
 
         Height and offset may be symbolic functions of (x, y). Heights are full
         thicknesses; nonpositive values have no interior. Callable fields need
-        enclosing 3D bounds for automatic bounds computation.
+        finite 3D bounds, which cap the resulting solid. Height and offset
+        coordinates clamp to those bounds outside their domain.
         Variable extrusion produces an implicit distance estimate.
         """
         if self.dim != 2:
@@ -458,8 +459,8 @@ def capsule(start: Iterable[float], end: Iterable[float], radius: float) -> Fiel
     return Field("capsule", 3, Capsule(a, b, _positive(radius)))
 
 
-def custom_sdf(fn, dim: int = 3, material_id: int = 0, *, lipschitz: float, bounds=None) -> Field:
-    """Capture a renderable scalar field; bounds enclose f <= 0 locally.
+def custom_sdf(fn, dim: int = 3, material_id: int = 0, *, lipschitz: float, bounds) -> Field:
+    """Capture a renderable scalar field capped by finite local bounds.
 
     The callable receives symbolic coordinates once. Its result must be a
     scalar distance or Hit(distance, material), using field-aware math.
@@ -473,7 +474,7 @@ def custom_sdf(fn, dim: int = 3, material_id: int = 0, *, lipschitz: float, boun
     from .bounds import as_aabb
     from .field import as_scalar, compile_glsl, coordinates, to_glsl
 
-    bounds = None if bounds is None else as_aabb(bounds, dim)
+    bounds = as_aabb(bounds, dim)
     lipschitz = _positive(lipschitz)
     try:
         value = fn(*coordinates()[:dim])

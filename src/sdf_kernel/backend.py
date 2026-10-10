@@ -14,6 +14,11 @@ def _round_box(p, half_size, radius):
     return _length(np.maximum(q, 0)) + np.minimum(np.max(q, axis=-1), 0) - radius
 
 
+def _bounds_distance(p, bounds):
+    lower, upper = np.asarray(bounds.minimum), np.asarray(bounds.maximum)
+    return _round_box(p - (lower / 2 + upper / 2), upper / 2 - lower / 2, 0)
+
+
 def _segment(p, a, b):
     a, b = np.asarray(a), np.asarray(b)
     edge = b - a
@@ -241,7 +246,10 @@ def evaluate_field(field, points):
             distance = evaluate_field(data.distance, *coordinates)
             material = evaluate_field(data.material, *coordinates)
             return (
-                np.broadcast_to(np.asarray(distance), q.shape[:-1]),
+                np.maximum(
+                    np.broadcast_to(np.asarray(distance), q.shape[:-1]),
+                    _bounds_distance(q, data.bounds),
+                ),
                 np.broadcast_to(np.asarray(material, dtype=np.int32), q.shape[:-1]),
             )
         if kind in ("min", "max", "subtract", "smooth_union"):
@@ -267,7 +275,9 @@ def evaluate_field(field, points):
         if kind == "warp":
             warp = data.warp
             distance, material = evaluate(child, warp.map_points(q))
-            return distance * warp.distance_scale, material
+            return np.maximum(
+                distance * warp.distance_scale, _bounds_distance(q, data.bounds)
+            ), material
         if kind == "linear_pattern":
             step = np.asarray(data.step)
             best, material = evaluate(child, q)
@@ -308,7 +318,10 @@ def evaluate_field(field, points):
         if kind in ("field_morph", "loft", "variable_extrude"):
             from .operations import evaluate_operation
 
-            return evaluate_operation(node, q, evaluate)
+            distance, material = evaluate_operation(node, q, evaluate)
+            if kind == "variable_extrude":
+                distance = np.maximum(distance, _bounds_distance(q, data.bounds))
+            return distance, material
         if kind == "profile_sweep":
             from .sweep import evaluate_sweep
 

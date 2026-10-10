@@ -160,10 +160,8 @@ def _analytic(field, level=0.0):
                 box = _points_bounds(segment.points)
             result = result.union(box)
         return result.expanded(padding)
-    if kind == "custom":
-        if level <= 0 and data.bounds is not None:
-            return data.bounds
-        return _unknown(dim)
+    if kind in ("custom", "warp"):
+        return data.bounds.expanded(padding)
     if kind in ("min", "max", "subtract", "smooth_union"):
         threshold = level + (data.radius / 4 if kind == "smooth_union" else 0)
         a = _analytic(child, threshold)
@@ -210,8 +208,6 @@ def _analytic(field, level=0.0):
         )
     if kind == "slice":
         return _slice_bounds(_analytic(child, level), data.plane)
-    if kind == "warp":
-        return data.bounds if level <= 0 and data.bounds is not None else _unknown(dim)
     if kind in ("field_morph", "loft", "variable_extrude"):
         from .operations import operation_bounds
 

@@ -196,10 +196,10 @@ def _node_count(scene):
     return len(seen)
 
 
-def _render_chunked(compiled, config, width, height):
+def _render_chunked(compiled, config, width, height, *, bvh):
     parts = compiled.parts
     if len(parts) < 2:
-        return _render_webgl(compile_glsl(compiled), config, width, height)
+        return _render_webgl(compile_glsl(compiled, bvh=bvh), config, width, height)
     layers = []
     depths = []
     start = 0
@@ -210,7 +210,7 @@ def _render_chunked(compiled, config, width, height):
             end = start + (end - start) // 2
             field = min_(*(part.field for part in parts[start:end]))
         group = CompiledScene(field, compiled.materials, parts[start:end])
-        shader = compile_glsl(group)
+        shader = compile_glsl(group, bvh=bvh)
         part_config = {**config, "bounds": _scene_bounds(field)}
         color = _render_webgl(shader, {**part_config, "captureMode": 1}, width, height)
         depth = _render_webgl(shader, {**part_config, "captureMode": 2}, width, height)
@@ -246,7 +246,7 @@ def render(
     materials=None,
     final=False,
     aa="auto",
-    bvh=False,
+    bvh=True,
     up=None,
     orientation=None,
 ):
@@ -289,7 +289,7 @@ def render(
     scale = 2 if mode in ("ssaa", "adaptive") else 1
     config = _config(scene, materials, eye, target, fov, camera_size, far, final, up, orientation)
     if _node_count(scene) > 1000:
-        image = _render_chunked(compiled, config, width * scale, height * scale)
+        image = _render_chunked(compiled, config, width * scale, height * scale, bvh=bvh)
     else:
         shader = compile_glsl(compiled, bvh=bvh)
         image = _render_webgl(shader, config, width * scale, height * scale)
@@ -316,7 +316,12 @@ def main():
     parser.add_argument("--camera-size", type=float, default=2.0)
     parser.add_argument("--far", type=float, default=20)
     parser.add_argument("--final", action="store_true")
-    parser.add_argument("--bvh", action="store_true", help="prune bounded union components on GPU")
+    parser.add_argument(
+        "--bvh",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="accelerate bounded geometry on GPU (default: enabled)",
+    )
     parser.add_argument(
         "--aa", choices=("auto", "none", "fxaa", "smaa", "ssaa", "adaptive"), default="auto"
     )

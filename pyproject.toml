@@ -2,6 +2,8 @@
 name = "agent-sdf"
 version = "0.1.0"
 description = "GLSL signed distance geometry and rendering"
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.14,<3.15"
 dependencies = [
     "numpy>=2,<3",
@@ -14,6 +16,7 @@ scientific = ["scipy>=1,<2"]
 
 [project.scripts]
 sdf-render = "sdf_kernel.renderer:main"
+sdf-contact-sheet = "sdf_kernel.contact_sheet:main"
 sdf-view = "sdf_kernel.viewer:main"
 sdf-view-glsl = "sdf_kernel.glsl_viewer:main"
 

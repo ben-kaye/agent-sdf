@@ -3,10 +3,14 @@
 import math
 
 from sdf_kernel import (
+    Assembly,
     Curve,
-    Model,
+    Field,
+    LoftStation,
+    Material,
+    Part,
     Plane,
-    Shape,
+    Scene,
     box,
     capsule,
     cylinder,
@@ -29,7 +33,7 @@ def block(x, y, z, sx, sy, sz, radius=0):
 
 
 def xz_profile(points, depth, y=0):
-    profile = points if isinstance(points, Shape) else polygon(points)
+    profile = points if isinstance(points, Field) else polygon(points)
     return profile.on(Plane.xz(y=y)).extrude(depth)
 
 
@@ -37,13 +41,13 @@ def curved_body_profile():
     return (
         Curve(-2.218, 0.33)
         .line_to(-2.218, 0.72)
-        .quad_to((-2.17, 0.82), (-1.96, 0.86), steps=5)
-        .quad_to((-1.590312, 0.895750), (-1.233750, 0.904500), steps=4)
-        .quad_to((-0.877188, 0.913250), (-0.65, 0.916), steps=4)
+        .quad_to((-2.17, 0.82), (-1.96, 0.86), 165)
+        .quad_to((-1.590312, 0.895750), (-1.233750, 0.904500), 164)
+        .quad_to((-0.877188, 0.913250), (-0.65, 0.916), 164)
         .line_to(0.75, 0.925)
-        .quad_to((1.205313, 0.927938), (1.486250, 0.914000), steps=3)
-        .quad_to((1.767188, 0.900062), (1.90, 0.87), steps=3)
-        .quad_to((2.12, 0.79), (2.218, 0.66), steps=5)
+        .quad_to((1.205313, 0.927938), (1.486250, 0.914000), 163)
+        .quad_to((1.767188, 0.900062), (1.90, 0.87), 163)
+        .quad_to((2.12, 0.79), (2.218, 0.66), 165)
         .line_to(2.218, 0.30)
         .line_to(1.92, 0.22)
         .line_to(-1.92, 0.22)
@@ -54,12 +58,12 @@ def curved_body_profile():
 def curved_roof_profile():
     return (
         Curve(-2.04, 0.855)
-        .quad_to((-2.00, 0.93), (-1.94, 0.945), steps=4)
-        .quad_to((-1.678438, 1.038437), (-1.351250, 1.130000), steps=5)
-        .quad_to((-1.024063, 1.221562), (-0.89, 1.225), steps=5)
-        .quad_to((-0.80, 1.27), (-0.68, 1.268), steps=4)
+        .quad_to((-2.00, 0.93), (-1.94, 0.945), 164)
+        .quad_to((-1.678438, 1.038437), (-1.351250, 1.130000), 165)
+        .quad_to((-1.024063, 1.221562), (-0.89, 1.225), 165)
+        .quad_to((-0.80, 1.27), (-0.68, 1.268), 164)
         .line_to(0.10, 1.275)
-        .quad_to((0.19, 1.27), (0.24, 1.247), steps=4)
+        .quad_to((0.19, 1.27), (0.24, 1.247), 164)
         .line_to(0.76, 0.925)
         .close()
     )
@@ -106,43 +110,44 @@ def sloped_screen(low, high, depth, thickness, outward):
     )
 
 
-MODEL = Model()
-paint = MODEL.material("gloss_black_paint", base_color="#252d32", metallic=0.42, roughness=0.20)
-trim = MODEL.material("black_polymer", base_color="#11171b", metallic=0.05, roughness=0.61)
-glass_id = MODEL.material("smoked_glass", base_color="#1d3542", metallic=0.13, roughness=0.13)
-rubber = MODEL.material("gatorback_rubber", base_color="#17191b", metallic=0.0, roughness=0.87)
-alloy = MODEL.material("centurion_alloy", base_color="#aeb4b5", metallic=0.74, roughness=0.28)
-silver = MODEL.material("silver_graphics", base_color="#9ca4a7", metallic=0.42, roughness=0.38)
-white = MODEL.material("sealed_beam_headlamp", base_color="#dce2dc", metallic=0.04, roughness=0.18)
-red = MODEL.material("rear_lamp_red", base_color="#ba211c", metallic=0.0, roughness=0.24)
-amber = MODEL.material("front_marker_amber", base_color="#db6a23", metallic=0.0, roughness=0.28)
-
-
-def attach(name, shape, material):
-    MODEL.define(name, shape.with_material(material))
-    MODEL.apply(name + "_attached", "min", name)
-
+paint = Material("gloss_black_paint", base_color="#252d32", metallic=0.42, roughness=0.20)
+trim = Material("black_polymer", base_color="#11171b", metallic=0.05, roughness=0.61)
+glass_material = Material("smoked_glass", base_color="#1d3542", metallic=0.13, roughness=0.13)
+rubber = Material("gatorback_rubber", base_color="#17191b", metallic=0.0, roughness=0.87)
+alloy = Material("centurion_alloy", base_color="#aeb4b5", metallic=0.74, roughness=0.28)
+silver = Material("silver_graphics", base_color="#9ca4a7", metallic=0.42, roughness=0.38)
+white = Material("sealed_beam_headlamp", base_color="#dce2dc", metallic=0.04, roughness=0.18)
+red = Material("rear_lamp_red", base_color="#ba211c", metallic=0.0, roughness=0.24)
+amber = Material("front_marker_amber", base_color="#db6a23", metallic=0.0, roughness=0.28)
+MODEL = Assembly()
 
 # Side silhouette is an extruded sketch. A section loft gives the body its
 # measured changing width, and four cylinders open the wheel arches.
 width_stations = (
-    (-2.218, 0, 0.5, 0.740, 1),
-    (-1.97, 0, 0.5, 0.810, 1),
-    (-1.40, 0, 0.5, 0.825, 1),
-    (0.75, 0, 0.5, 0.815, 1),
-    (1.73, 0, 0.5, 0.807, 1),
-    (2.218, 0, 0.5, 0.690, 1),
+    LoftStation(-2.218, offset=(0, 0.5), scale=(0.740, 1)),
+    LoftStation(-1.97, offset=(0, 0.5), scale=(0.810, 1)),
+    LoftStation(-1.40, offset=(0, 0.5), scale=(0.825, 1)),
+    LoftStation(0.75, offset=(0, 0.5), scale=(0.815, 1)),
+    LoftStation(1.73, offset=(0, 0.5), scale=(0.807, 1)),
+    LoftStation(2.218, offset=(0, 0.5), scale=(0.690, 1)),
 )
 body_envelope = rectangle(2, 3).loft(width_stations, axis="x")
 body_shell = xz_profile(curved_body_profile(), 1.9) & body_envelope
 arches = min_(*(y_cylinder(axle, 0, WHEEL_Z, 0.320, 1.9) for axle in (FRONT_AXLE, REAR_AXLE)))
-MODEL.start("hatchback_body_and_wheel_openings", (body_shell - arches).with_material(paint))
+MODEL.add("hatchback_body_and_wheel_openings", Part(body_shell - arches, material=paint))
 
 roof_width = rectangle(6, 2).loft(
-    ((0.85, 0, 0, 1, 0.76), (0.94, 0, 0, 1, 0.735), (1.15, 0, 0, 1, 0.66), (1.275, 0, 0, 1, 0.60)),
+    (
+        LoftStation(0.85, scale=(1, 0.76)),
+        LoftStation(0.94, scale=(1, 0.735)),
+        LoftStation(1.15, scale=(1, 0.66)),
+        LoftStation(1.275, scale=(1, 0.60)),
+    ),
     axis="z",
 )
-attach("sloping_hatch_roof", xz_profile(curved_roof_profile(), 1.7) & roof_width, paint)
+MODEL.add(
+    "sloping_hatch_roof", Part(xz_profile(curved_roof_profile(), 1.7) & roof_width, material=paint)
+)
 
 painted = [
     block(1.46, 0, 0.933, 0.56, 0.46, 0.044, 0.009),
@@ -151,8 +156,8 @@ painted = [
     # The hood center swells gently into the offset scoop.
     xz_profile(
         Curve(0.93, 0.924)
-        .quad_to((1.19, 0.977), (1.48, 0.990), steps=6)
-        .quad_to((1.72, 0.981), (1.88, 0.912), steps=6)
+        .quad_to((1.19, 0.977), (1.48, 0.990), 166)
+        .quad_to((1.72, 0.981), (1.88, 0.912), 166)
         .close(),
         0.46,
     ),
@@ -174,7 +179,7 @@ for side in (-1, 1):
             block(-1.998, side * 0.58, 0.941, 0.36, 0.25, 0.026, 0.007),
         )
     )
-attach("shelby_spoiler_hood_air_dam_and_flares", min_(*painted), paint)
+MODEL.add("shelby_spoiler_hood_air_dam_and_flares", Part(min_(*painted), material=paint))
 
 # Shared wheel prototypes keep the GLSL scene compact.
 tire_profile = y_cylinder(0, 0, 0, 0.293, 0.205) - y_cylinder(0, 0, 0, 0.194, 0.24)
@@ -207,9 +212,11 @@ for axle in (FRONT_AXLE, REAR_AXLE):
                 cap_profile.translate(axle, side * 0.861, WHEEL_Z),
             )
         )
-attach("rounded_gatorback_tires", min_(*tires, *sidewalls), rubber)
-attach("wheel_recesses", min_(*barrels), trim)
-attach("five_spoke_centurion_wheels", min_(*wheels), alloy)
+wheel_assembly = Assembly()
+wheel_assembly.add("rounded_gatorback_tires", Part(min_(*tires, *sidewalls), material=rubber))
+wheel_assembly.add("wheel_recesses", Part(min_(*barrels), material=trim))
+wheel_assembly.add("five_spoke_centurion_wheels", Part(min_(*wheels), material=alloy))
+MODEL.add("wheels", wheel_assembly)
 
 # The side panes lean inward with the roof. Separate outer and inset panels
 # retain the painted B pillar and narrow black gasket.
@@ -237,22 +244,22 @@ for side in (-1, 1):
         .quad_to(
             (-1.465938, side * 0.823719, 0.810969),
             (-0.788750, side * 0.825125, 0.818875),
-            steps=5,
+            165,
         )
         .quad_to(
             (-0.111562, side * 0.826531, 0.826781),
             (0.56, side * 0.824, 0.824),
-            steps=5,
+            165,
         )
         .quad_to(
             (1.043438, side * 0.829250, 0.822469),
             (1.431250, side * 0.815750, 0.798625),
-            steps=4,
+            164,
         )
         .quad_to(
             (1.819062, side * 0.802250, 0.774781),
             (2.07, side * 0.770, 0.729),
-            steps=4,
+            164,
         )
     )
     window_trim.extend(
@@ -277,8 +284,8 @@ for side in (-1, 1):
             block(0.620, side * 0.900, 0.935, 0.120, 0.018, 0.07, 0.006),
         )
     )
-attach("fascias_and_window_seals", min_(*window_trim), trim)
-attach("windscreen_hatch_and_side_glass", min_(*glazing), glass_id)
+MODEL.add("fascias_and_window_seals", Part(min_(*window_trim), material=trim))
+MODEL.add("windscreen_hatch_and_side_glass", Part(min_(*glazing), material=glass_material))
 
 headlamps, taillamps, markers, brightwork = [], [], [], []
 for side in (-1, 1):
@@ -316,10 +323,10 @@ for k in range(-3, 4):
     brightwork.append(line((2.248, k * 0.089, 0.594), (2.248, k * 0.089, 0.654), 0.003))
 for z in (0.331, 0.36, 0.389):
     brightwork.append(line((2.323, -0.49, z), (2.323, 0.49, z), 0.003))
-attach("square_sealed_beam_headlamps", min_(*headlamps), white)
-attach("rear_tail_lamps", min_(*taillamps), red)
-attach("amber_front_markers", min_(*markers), amber)
-attach("silver_stripe_handles_and_exhaust", min_(*brightwork), silver)
+MODEL.add("square_sealed_beam_headlamps", Part(min_(*headlamps), material=white))
+MODEL.add("rear_tail_lamps", Part(min_(*taillamps), material=red))
+MODEL.add("amber_front_markers", Part(min_(*markers), material=amber))
+MODEL.add("silver_stripe_handles_and_exhaust", Part(min_(*brightwork), material=silver))
 
 GLYPH_PATHS = {
     "S": ((1, 1), (0, 1), (0, 0.5), (1, 0.5), (1, 0), (0, 0)),
@@ -358,6 +365,6 @@ for side in (-1, 1):
             for point in points[1:]:
                 curve.line_to(*point)
             graphics.append(curve.tube(0.0035))
-attach("shelby_and_glhs_graphics", min_(*graphics), silver)
+MODEL.add("shelby_and_glhs_graphics", Part(min_(*graphics), material=silver))
 
-SCENE = MODEL.scene()
+SCENE = Scene(shelby=MODEL)

@@ -64,7 +64,9 @@ def extrude(
         raise ValueError("extrusion gradient bounds must be nonnegative")
     if not callable(height) and not callable(offset) and bounds is None:
         return Field("extrude", 3, Extrude(height, offset), (profile,))
-    bounds = None if bounds is None else as_aabb(bounds, 3)
+    if bounds is None:
+        raise ValueError("callable extrusion requires finite bounds to cap the geometry")
+    bounds = as_aabb(bounds, 3)
     return Field(
         "variable_extrude",
         3,
@@ -82,7 +84,9 @@ def _capped(planar, axial):
 def evaluate_operation(node, q, evaluate):
     if node.kind == "variable_extrude":
         height, offset = node.data.height, node.data.offset
-        x, y, z = q[..., 0], q[..., 1], q[..., 2]
+        box = node.data.bounds
+        xy = np.clip(q[..., :2], box.minimum[:2], box.maximum[:2])
+        x, y, z = xy[..., 0], xy[..., 1], q[..., 2]
         height = np.asarray(height(x, y) if callable(height) else height)
         offset = np.asarray(offset(x, y) if callable(offset) else offset)
         distance, material = evaluate(node.children[0], q[..., :2])
@@ -123,16 +127,19 @@ def operation_bounds(node, level, analytic):
     padding = max(0.0, level)
     if node.kind == "variable_extrude":
         height, offset, box = node.data.height, node.data.offset, node.data.bounds
-        if box is not None and level <= 0:
-            return box
+        bounded = box.expanded(padding)
         planar = analytic(node.children[0], level)
         if planar.is_empty:
             return _empty(3)
         if callable(height) or callable(offset):
-            return AABB((*planar.minimum, -float("inf")), (*planar.maximum, float("inf")))
-        return AABB(
-            (*planar.minimum, offset - height / 2 - padding),
-            (*planar.maximum, offset + height / 2 + padding),
+            return bounded.intersection(
+                AABB((*planar.minimum, -float("inf")), (*planar.maximum, float("inf")))
+            )
+        return bounded.intersection(
+            AABB(
+                (*planar.minimum, offset - height / 2 - padding),
+                (*planar.maximum, offset + height / 2 + padding),
+            )
         )
     stations, (axis, transverse) = node.data.stations, node.data.axes
     if node.kind == "field_morph":

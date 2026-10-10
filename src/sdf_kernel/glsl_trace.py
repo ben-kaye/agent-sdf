@@ -15,11 +15,14 @@ bool marchPart(int part, vec3 origin, vec3 ray, float start, float end,
   for (int i = 0; i < 256; ++i) {
     if (travel > end) return false;
     vec3 p = origin + travel * ray;
-    hit = mapHitSurface(p, part);
-    if (isnan(hit.x) || isinf(hit.x)) return false;
-    bool skip = escaping && abs(hit.x) < 0.004;
-    if (!skip && abs(hit.x) < 0.001) return true;
-    float step = mapHitStep(p, ray, part);
+    vec2 query = mapHitQuery(p, ray, part);
+    if (isnan(query.x) || isinf(query.x)) return false;
+    bool skip = escaping && abs(query.x) < 0.004;
+    if (!skip && abs(query.x) < 0.001) {
+      hit = mapHitSurface(p, part);
+      return true;
+    }
+    float step = query.y;
     if (isnan(step) || isinf(step)) return false;
     if (skip) step = max(step * 0.75, 0.002);
     else escaping = false;
@@ -63,14 +66,14 @@ def _part_box(field):
     return box.expanded(padding)
 
 
-def _surface_tracer(compiled, roots, steps, *, enabled):
+def _surface_tracer(compiled, roots, queries, *, enabled):
     from .glsl import _v
 
     if not enabled:
         return "\n".join(
             [
                 "vec3 mapHitSurface(vec3 p, int part) { return mapSurface(p); }",
-                "float mapHitStep(vec3 p, vec3 ray, int part) { return mapSurfaceStep(p, ray); }",
+                "vec2 mapHitQuery(vec3 p, vec3 ray, int part) { return mapSurfaceQuery(p, ray); }",
                 _MARCH,
                 """bool traceSurface(vec3 origin, vec3 ray, float start, float end,
                     bool escaping, out float travel, out vec3 hit, out int part) {
@@ -84,9 +87,12 @@ def _surface_tracer(compiled, roots, steps, *, enabled):
         "vec3 mapHitSurface(vec3 p, int part) { switch (part) {",
         *(f"case {i}: return {root}(p);" for i, root in enumerate(roots)),
         "} return vec3(1e30, 0.0, 0.0); }",
-        "float mapHitStep(vec3 p, vec3 ray, int part) { switch (part) {",
-        *(f"case {i}: return abs({step}(p, ray));" for i, step in enumerate(steps)),
-        "} return 1e30; }",
+        "vec2 mapHitQuery(vec3 p, vec3 ray, int part) { vec2 h; switch (part) {",
+        *(
+            f"case {i}: h = {query}(p, ray); return vec2(h.x, abs(h.y));"
+            for i, query in enumerate(queries)
+        ),
+        "} return vec2(1e30); }",
         _MARCH,
         _INTERVAL,
     ]

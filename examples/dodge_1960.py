@@ -2,7 +2,21 @@
 
 import math
 
-from sdf_kernel import Model, Plane, box, capsule, cylinder, min_, polygon, rectangle, torus
+from sdf_kernel import (
+    Assembly,
+    LoftStation,
+    Material,
+    Part,
+    Plane,
+    Scene,
+    box,
+    capsule,
+    cylinder,
+    min_,
+    polygon,
+    rectangle,
+    torus,
+)
 
 WHEELBASE = 2.9718  # 117 in
 AXLES = (-WHEELBASE / 2, WHEELBASE / 2)
@@ -66,10 +80,10 @@ def side_panel(points, side, depth=0.024):
 def roof_width_envelope(margin=0):
     return rectangle(6, 2).loft(
         (
-            (1.0, 0, 0, 1, 0.79 - margin),
-            (1.08, 0, 0, 1, 0.765 - margin),
-            (1.32, 0, 0, 1, 0.61 - margin),
-            (1.36, 0, 0, 1, 0.59 - margin),
+            LoftStation(1.0, scale=(1, 0.79 - margin)),
+            LoftStation(1.08, scale=(1, 0.765 - margin)),
+            LoftStation(1.32, scale=(1, 0.61 - margin)),
+            LoftStation(1.36, scale=(1, 0.59 - margin)),
         ),
         axis="z",
     )
@@ -102,37 +116,34 @@ def rear_screen(margin):
     return profile
 
 
-MODEL = Model()
-paint = MODEL.material("r_t_dark_green", base_color="#28544a", metallic=0.53, roughness=0.24)
-glass_id = MODEL.material(
+paint = Material("r_t_dark_green", base_color="#28544a", metallic=0.53, roughness=0.24)
+glass_material = Material(
     "period_tinted_glass", base_color="#1f3437", metallic=0.10, roughness=0.12
 )
-black = MODEL.material("grille_and_seals", base_color="#171a19", metallic=0.05, roughness=0.68)
-rubber = MODEL.material("bias_ply_rubber", base_color="#151615", metallic=0.0, roughness=0.92)
-chrome = MODEL.material("bright_chrome", base_color="#d0d2cc", metallic=0.93, roughness=0.17)
-red = MODEL.material("red_tail_lens", base_color="#a51817", metallic=0.02, roughness=0.21)
-amber = MODEL.material("amber_marker_lens", base_color="#df7e22", metallic=0.01, roughness=0.25)
-
-
-def attach(name, shape, material):
-    MODEL.define(name, shape.with_material(material))
-    MODEL.apply(name + "_attached", "min", name)
-
+black = Material("grille_and_seals", base_color="#171a19", metallic=0.05, roughness=0.68)
+rubber = Material("bias_ply_rubber", base_color="#151615", metallic=0.0, roughness=0.92)
+chrome = Material("bright_chrome", base_color="#d0d2cc", metallic=0.93, roughness=0.17)
+red = Material("red_tail_lens", base_color="#a51817", metallic=0.02, roughness=0.21)
+amber = Material("amber_marker_lens", base_color="#df7e22", metallic=0.01, roughness=0.25)
+MODEL = Assembly()
 
 # A side profile and width loft form the coke-bottle body. Cylinders open
 # the wheel arches before the visible wheel geometry is attached.
 body_profile = xz_profile(tuple(zip(STATIONS, TOPS, strict=True)) + tuple(reversed(BOTTOMS)), 2.1)
 width_envelope = rectangle(2, 3).loft(
-    tuple((x, 0, 0.7, width, 1) for x, width in zip(STATIONS, WIDTHS, strict=True)),
+    tuple(
+        LoftStation(x, offset=(0, 0.7), scale=(width, 1))
+        for x, width in zip(STATIONS, WIDTHS, strict=True)
+    ),
     axis="x",
 )
 body = body_profile & width_envelope
 arches = min_(*(y_cylinder(axle, 0, WHEEL_Z, 0.403, 1.05) for axle in AXLES))
-MODEL.start("coke_bottle_body_and_wheel_openings", (body - arches).with_material(paint))
+MODEL.add("coke_bottle_body_and_wheel_openings", Part(body - arches, material=paint))
 
 roof = xz_profile(ROOF_OUTLINE, 1.7) & roof_width_envelope()
 recess = xz_profile(((-2, 1.045), (-1.489, 1.045), (-1.065, 1.318), (-2, 1.318)), 1.07)
-attach("flying_buttress_roof", roof - recess, paint)
+MODEL.add("flying_buttress_roof", Part(roof - recess, material=paint))
 
 painted = []
 flare = torus(0.418, 0.018).rotate(math.pi / 2, "x")
@@ -148,7 +159,7 @@ painted.extend(
 )
 for side in (-1, 1):
     painted.append(block(-0.01, side * 0.807, 0.285, 1.04, 0.034, 0.055, 0.013))
-attach("hood_fenders_and_sills", min_(*painted), paint)
+MODEL.add("hood_fenders_and_sills", Part(min_(*painted), material=paint))
 
 tire = y_cylinder(0, 0, 0, 0.348, 0.132) - y_cylinder(0, 0, 0, 0.244, 0.15)
 wheel_dark = y_cylinder(0, 0, 0, 0.240, 0.018)
@@ -177,9 +188,11 @@ for axle in AXLES:
                 cap.translate(axle, cy + side * 0.009, WHEEL_Z),
             )
         )
-attach("four_period_tires", min_(*tires), rubber)
-attach("magnum_wheel_insets", min_(*dark_wheels), black)
-attach("magnum_five_spoke_wheels", min_(*chrome_wheels), chrome)
+wheel_assembly = Assembly()
+wheel_assembly.add("four_period_tires", Part(min_(*tires), material=rubber))
+wheel_assembly.add("magnum_wheel_insets", Part(min_(*dark_wheels), material=black))
+wheel_assembly.add("magnum_five_spoke_wheels", Part(min_(*chrome_wheels), material=chrome))
+MODEL.add("wheels", wheel_assembly)
 
 side_glass, side_seals = [], []
 for side in (-1, 1):
@@ -215,11 +228,10 @@ for side in (-1, 1):
     )
 for row in range(7):
     trim.append(block(2.668, 0, 0.683 + 0.032 * row, 0.006, 0.705, 0.003, 0.001))
-attach("grille_window_seals_and_panel_gaps", min_(*trim), black)
-attach(
+MODEL.add("grille_window_seals_and_panel_gaps", Part(min_(*trim), material=black))
+MODEL.add(
     "windscreens_and_side_glass",
-    min_(*side_glass, front_screen(0.027), rear_screen(0.026)),
-    glass_id,
+    Part(min_(*side_glass, front_screen(0.027), rear_screen(0.026)), material=glass_material),
 )
 
 red_lamps, amber_lamps, chrome_details, mirrors = [], [], [], []
@@ -259,9 +271,9 @@ chrome_details.extend(
         block(-2.682, 0, 0.793, 0.008, 0.023, 0.092, 0.003),
     )
 )
-attach("rectangular_1969_tail_lamps", min_(*red_lamps), red)
-attach("front_turn_and_side_markers", min_(*amber_lamps), amber)
-attach("split_grille_bumpers_and_trim", min_(*chrome_details), chrome)
-attach("fender_mirrors", min_(*mirrors), chrome)
-attach("shadowed_chassis", block(0, 0, 0.255, 1.685, 0.68, 0.0575, 0.025), black)
-SCENE = MODEL.scene()
+MODEL.add("rectangular_1969_tail_lamps", Part(min_(*red_lamps), material=red))
+MODEL.add("front_turn_and_side_markers", Part(min_(*amber_lamps), material=amber))
+MODEL.add("split_grille_bumpers_and_trim", Part(min_(*chrome_details), material=chrome))
+MODEL.add("fender_mirrors", Part(min_(*mirrors), material=chrome))
+MODEL.add("shadowed_chassis", Part(block(0, 0, 0.255, 1.685, 0.68, 0.0575, 0.025), material=black))
+SCENE = Scene(charger=MODEL)

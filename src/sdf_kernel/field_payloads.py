@@ -299,16 +299,19 @@ def validate_field(kind: str, dim: int, data: Payload, children: tuple[Any, ...]
         )
     ):
         raise ValueError("curve profile needs valid 2D segments")
+    if kind in ("custom", "warp", "variable_extrude"):
+        from .bounds import AABB, as_aabb
+
+        if not isinstance(data.bounds, AABB):
+            raise ValueError(f"{kind} requires finite AABB bounds to cap the geometry")
+        as_aabb(data.bounds, dim)
     if kind == "custom":
-        from .bounds import AABB
         from .field import Scalar
 
         if not isinstance(data.distance, Scalar) or data.distance.kind != "float":
             raise ValueError("custom distance must be a scalar field")
         if not isinstance(data.material, Scalar) or data.material.kind != "float":
             raise ValueError("custom material must be a scalar field")
-        if data.bounds is not None and not isinstance(data.bounds, AABB):
-            raise ValueError("custom bounds must be an AABB")
         if not _finite(data.lipschitz, positive=True):
             raise ValueError("custom Lipschitz bound must be positive and finite")
     if kind == "smooth_union" and not _finite(data.radius, positive=True):
@@ -334,15 +337,10 @@ def validate_field(kind: str, dim: int, data: Payload, children: tuple[Any, ...]
         if not isinstance(data.transform, Transform) or data.transform.dim != dim:
             raise ValueError("transform dimension must match field")
     if kind == "warp":
-        from .bounds import AABB, as_aabb
         from .warp import Warp
 
         if not isinstance(data.warp, Warp) or data.warp.dim != dim:
             raise ValueError("warp dimension must match field")
-        if data.bounds is not None:
-            if not isinstance(data.bounds, AABB):
-                raise ValueError("warp bounds must be an AABB")
-            as_aabb(data.bounds, dim)
     if kind == "offset" and not _finite(data.amount):
         raise ValueError("offset requires a finite value")
     if kind == "shell" and not _finite(data.thickness, positive=True):
