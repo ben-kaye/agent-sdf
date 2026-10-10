@@ -143,24 +143,38 @@ def _lipschitz(node, box):
     if kind == "loft":
         stations = data.stations
         axial = data.axes[0]
-        active = [
-            (a, b)
-            for a, b in zip(stations, stations[1:], strict=False)
-            if b[0] > box.minimum[axial] and a[0] < box.maximum[axial]
-        ]
+
+        def section_at(a, b, position):
+            t = (position - a[0]) / (b[0] - a[0])
+            return (position, *(x + t * (y - x) for x, y in zip(a[1:], b[1:], strict=True)))
+
+        active = []
+        for a, b in zip(stations, stations[1:], strict=False):
+            start = max(a[0], box.minimum[axial])
+            end = min(b[0], box.maximum[axial])
+            if end <= start:
+                continue
+            active.append((section_at(a, b, start), section_at(a, b, end)))
         if not active:
             active = [(stations[0], stations[1])]
         active_rows = tuple(row for pair in active for row in pair)
         minimum_scale = [min(row[3 + i] for row in active_rows) for i in range(2)]
-        max_offset = [max(abs(row[1 + i]) for row in active_rows) for i in range(2)]
-        max_uv = [max(abs(child_box.minimum[i]), abs(child_box.maximum[i])) for i in range(2)]
-        qmax = [(max_uv[i] + max_offset[i]) / minimum_scale[i] for i in range(2)]
+        maximum_scale = min(max(row[3] for row in active_rows), max(row[4] for row in active_rows))
+        offset_low = [min(row[1 + i] for row in active_rows) for i in range(2)]
+        offset_high = [max(row[1 + i] for row in active_rows) for i in range(2)]
+        displacement = [
+            max(
+                abs(child_box.minimum[i] - offset_high[i]),
+                abs(child_box.maximum[i] - offset_low[i]),
+            )
+            for i in range(2)
+        ]
+        qmax = [displacement[i] / minimum_scale[i] for i in range(2)]
         profile_box = AABB(tuple(-x for x in qmax), tuple(qmax))
         profile = node.children[0]
         profile_bound = _lipschitz(profile, profile_box)
         magnitude = _field_magnitude(profile, profile_box, profile_bound)
-        max_scale = max(max(row[3:]) for row in active_rows)
-        transverse_bound = max_scale * profile_bound / min(minimum_scale)
+        transverse_bound = maximum_scale * profile_bound / min(minimum_scale)
         axial_bound = 0.0
         for a, b in active:
             dz = b[0] - a[0]
@@ -169,13 +183,13 @@ def _lipschitz(node, box):
             mapped_slope = hypot(
                 *(
                     offset_slope[i] / minimum_scale[i]
-                    + (max_uv[i] + max_offset[i]) * scale_slope[i] / minimum_scale[i] ** 2
+                    + displacement[i] * scale_slope[i] / minimum_scale[i] ** 2
                     for i in range(2)
                 )
             )
             axial_bound = max(
                 axial_bound,
-                max(scale_slope) * magnitude + max_scale * profile_bound * mapped_slope,
+                max(scale_slope) * magnitude + maximum_scale * profile_bound * mapped_slope,
             )
         result = hypot(transverse_bound, axial_bound, 1.0)
         children = ()
@@ -274,6 +288,43 @@ def _field_kinds(node):
         yield from _field_kinds(child)
 
 
+def _loft_scale_spans(first, last, ratio=2.0, limit=24):
+    """Split a loft segment so each step box stays within a scale ratio.
+
+    The march certificate divides by the smallest scale in the box. One box
+    over a taper to a point stalls before the tip is reached.
+    """
+
+    def at(t):
+        return tuple(a + t * (b - a) for a, b in zip(first, last, strict=True))
+
+    def step(t):
+        dt = 1.0 - t
+        for start, end in zip(first[3:], last[3:], strict=True):
+            origin = start + t * (end - start)
+            slope = end - start
+            if origin <= 0.0 or slope == 0.0:
+                continue
+            limit_scale = origin * ratio if slope > 0.0 else origin / ratio
+            dt = min(dt, (limit_scale - origin) / slope)
+        return dt
+
+    spans = []
+    t = 0.0
+    for _ in range(limit):
+        if t >= 1.0 - 1e-12:
+            break
+        dt = step(t)
+        nxt = 1.0 if dt <= 1e-8 else min(1.0, t + dt)
+        spans.append((at(t), at(nxt)))
+        t = nxt
+    if not spans:
+        spans.append((first, last))
+    elif t < 1.0 - 1e-12:
+        spans.append((at(t), at(1.0)))
+    return spans
+
+
 def _section_span_box(node, first, last):
     from .bounds import AABB
 
@@ -364,7 +415,12 @@ class _StepLowerer:
 
     def _section_step(self, node, raw):
         lines = ["float best = 1e30;"]
-        for first, last in zip(node.data.stations, node.data.stations[1:], strict=False):
+        spans = (
+            span
+            for first, last in zip(node.data.stations, node.data.stations[1:], strict=False)
+            for span in _loft_scale_spans(first, last)
+        )
+        for first, last in spans:
             box = _section_span_box(node, first, last)
             pad = max(
                 1e-4,
@@ -376,7 +432,11 @@ class _StepLowerer:
                 [
                     "{",
                     f"vec3 gap = max(max({_v(box.minimum)} - p, p - {_v(box.maximum)}), 0.0);",
-                    f"float candidate = any(greaterThan(gap, vec3(0.0))) ? rayBoxEntry(p, ray, {_v(box.minimum)}, {_v(box.maximum)}) + {_f(pad * 0.5)} : {raw}(p).x / {_f(bound)};",
+                    "float candidate;",
+                    "if (any(greaterThan(gap, vec3(0.0))))",
+                    f"  candidate = rayBoxEntry(p, ray, {_v(box.minimum)}, {_v(box.maximum)}) + {_f(pad * 0.5)};",
+                    "else",
+                    f"  candidate = {raw}(p).x / {_f(bound)};",
                     "best = min(best, candidate);",
                     "}",
                 ]
@@ -917,6 +977,9 @@ def compile_glsl(scene, *, bvh=False):
 
     Set bvh to prune certified union components on the GPU.
     """
+    from .glsl_trace import _surface_tracer
+
+    traverse_parts = bvh
     compiled = compile_scene(scene)
     scene = compiled.field
     if scene.dim != 3:
@@ -979,6 +1042,7 @@ def compile_glsl(scene, *, bvh=False):
             + "\n".join(f"  {line}" for line in step_lines)
             + "\n}",
         ]
+    surface_source.append(_surface_tracer(compiled, part_roots, part_steps, enabled=traverse_parts))
     if not bvh:
         return "\n".join(
             [
