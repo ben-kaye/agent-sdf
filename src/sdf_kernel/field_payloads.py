@@ -1,4 +1,4 @@
-"""Typed payloads and construction rules for Shape nodes."""
+"""Typed payloads and construction rules for Field nodes."""
 
 from __future__ import annotations
 
@@ -211,10 +211,10 @@ def _vector(value: Any, dim: int) -> bool:
     return isinstance(value, tuple) and len(value) == dim and all(_finite(x) for x in value)
 
 
-def validate_shape(kind: str, dim: int, data: Payload, children: tuple[Any, ...]) -> None:
+def validate_field(kind: str, dim: int, data: Payload, children: tuple[Any, ...]) -> None:
     """Reject malformed nodes before they reach evaluation, bounds, or GLSL."""
     if kind not in _SPECS:
-        raise ValueError(f"unknown shape kind: {kind}")
+        raise ValueError(f"unknown field kind: {kind}")
     payload_type, expected_dim, child_count = _SPECS[kind]
     if dim not in (2, 3) or (expected_dim is not None and dim != expected_dim):
         raise ValueError(f"{kind} has an invalid dimension")
@@ -225,11 +225,11 @@ def validate_shape(kind: str, dim: int, data: Payload, children: tuple[Any, ...]
     ):
         raise ValueError(f"{kind} has an invalid number of children")
     if any(getattr(child, "dim", None) not in (2, 3) for child in children):
-        raise ValueError(f"{kind} children must be shapes")
+        raise ValueError(f"{kind} children must be fields")
     if kind in ("min", "max", "subtract", "smooth_union") and any(
         child.dim != dim for child in children
     ):
-        raise ValueError(f"{kind} children must match shape dimension")
+        raise ValueError(f"{kind} children must match field dimension")
     if kind in ("extrude", "variable_extrude", "revolve", "loft", "profile_sweep"):
         if children[0].dim != 2:
             raise ValueError(f"{kind} requires a 2D profile")
@@ -240,9 +240,9 @@ def validate_shape(kind: str, dim: int, data: Payload, children: tuple[Any, ...]
         from .plane import Plane
 
         if children[0].dim != 3 or not isinstance(data.plane, Plane):
-            raise ValueError("slice requires a 3D shape and a Plane")
+            raise ValueError("slice requires a 3D field and a Plane")
     elif any(child.dim != dim for child in children):
-        raise ValueError(f"{kind} children must match shape dimension")
+        raise ValueError(f"{kind} children must match field dimension")
 
     if kind in ("circle", "sphere") and not _finite(data.radius, positive=True):
         raise ValueError("radius must be positive and finite")
@@ -332,13 +332,13 @@ def validate_shape(kind: str, dim: int, data: Payload, children: tuple[Any, ...]
         from .transform import Transform
 
         if not isinstance(data.transform, Transform) or data.transform.dim != dim:
-            raise ValueError("transform dimension must match shape")
+            raise ValueError("transform dimension must match field")
     if kind == "warp":
         from .bounds import AABB, as_aabb
         from .warp import Warp
 
         if not isinstance(data.warp, Warp) or data.warp.dim != dim:
-            raise ValueError("warp dimension must match shape")
+            raise ValueError("warp dimension must match field")
         if data.bounds is not None:
             if not isinstance(data.bounds, AABB):
                 raise ValueError("warp bounds must be an AABB")

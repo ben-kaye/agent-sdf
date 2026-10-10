@@ -8,10 +8,7 @@ from math import isfinite
 
 import numpy as np
 
-from .hit import Hit
-from .materials import validate_material_id
-from .plane import Plane, _cross
-from .shape_payloads import (
+from .field_payloads import (
     Box,
     Capsule,
     Custom,
@@ -32,8 +29,11 @@ from .shape_payloads import (
     Torus,
     TransformPayload,
     WarpPayload,
-    validate_shape,
+    validate_field,
 )
+from .hit import Hit
+from .materials import validate_material_id
+from .plane import Plane, _cross
 from .transform import Placement, Transform, _vector_args
 from .warp import Warp
 
@@ -86,19 +86,19 @@ class LoftStation:
 
 
 @dataclass(frozen=True)
-class Shape:
+class Field:
     kind: str
     dim: int
     data: Payload = Empty()
-    children: tuple[Shape, ...] = ()
+    children: tuple[Field, ...] = ()
 
     def __post_init__(self):
-        validate_shape(self.kind, self.dim, self.data, self.children)
+        validate_field(self.kind, self.dim, self.data, self.children)
 
     def sample(self, points):
-        from .backend import evaluate_shape
+        from .backend import evaluate_field
 
-        return evaluate_shape(self, points)
+        return evaluate_field(self, points)
 
     def __call__(self, *point):
         point = np.asarray(_vector_args(point), dtype=np.float32)
@@ -112,12 +112,12 @@ class Shape:
 
     def bounds(self, scene_bounds=None, *, tolerance=0.01, max_cells=65536):
         """Return analytic bounds, clipped to scene_bounds when unresolved."""
-        from .bounds import shape_bounds
+        from .bounds import field_bounds
 
-        return shape_bounds(self, scene_bounds, tolerance=tolerance, max_cells=max_cells)
+        return field_bounds(self, scene_bounds, tolerance=tolerance, max_cells=max_cells)
 
     def extents(self, scene_bounds=None, *, tolerance=0.01, max_cells=65536):
-        """Return axis lengths of the conservative bounds (zero for empty shapes)."""
+        """Return axis lengths of the conservative bounds (zero for empty fields)."""
         return self.bounds(scene_bounds, tolerance=tolerance, max_cells=max_cells).extents
 
     def bvh(self, scene_bounds=None, *, tolerance=0.01, max_cells=65536, leaf_size=1):
@@ -128,38 +128,38 @@ class Shape:
             self, scene_bounds, tolerance=tolerance, max_cells=max_cells, leaf_size=leaf_size
         )
 
-    def __or__(self, other: Shape) -> Shape:
+    def __or__(self, other: Field) -> Field:
         return min_(self, other)
 
-    def __and__(self, other: Shape) -> Shape:
+    def __and__(self, other: Field) -> Field:
         return max_(self, other)
 
-    def __sub__(self, other: Shape) -> Shape:
+    def __sub__(self, other: Field) -> Field:
         return _binary("subtract", self, other)
 
-    def __xor__(self, other: Shape) -> Shape:
+    def __xor__(self, other: Field) -> Field:
         _same_dim(self, other)
         return (self - other) | (other - self)
 
-    def smooth_union(self, other: Shape, radius: float) -> Shape:
+    def smooth_union(self, other: Field, radius: float) -> Field:
         _same_dim(self, other)
-        return Shape("smooth_union", self.dim, SmoothUnion(_positive(radius)), (self, other))
+        return Field("smooth_union", self.dim, SmoothUnion(_positive(radius)), (self, other))
 
-    def translate(self, *offset: float) -> Shape:
+    def translate(self, *offset: float) -> Field:
         return self.transform(Transform.translation(*_point(_vector_args(offset), self.dim)))
 
-    def rotate(self, angle: float, axis: str = "z") -> Shape:
+    def rotate(self, angle: float, axis: str = "z") -> Field:
         return self.transform(Transform.rotation(angle, axis, dim=self.dim))
 
-    def scale(self, factor: float) -> Shape:
+    def scale(self, factor: float) -> Field:
         return self.transform(Transform.scaling(*((_positive(factor),) * self.dim)))
 
-    def transform(self, transform: Transform) -> Shape:
+    def transform(self, transform: Transform) -> Field:
         if not isinstance(transform, Transform) or transform.dim != self.dim:
-            raise ValueError("shape and transform dimensions must match")
-        return Shape("transform", self.dim, TransformPayload(transform), (self,))
+            raise ValueError("field and transform dimensions must match")
+        return Field("transform", self.dim, TransformPayload(transform), (self,))
 
-    def place(self, placement: Placement) -> Shape:
+    def place(self, placement: Placement) -> Field:
         """Apply a reusable rigid placement to a 3D solid."""
         if self.dim != 3:
             raise ValueError("place requires a 3D solid; use profile.on(plane) for a 2D sketch")
@@ -167,20 +167,20 @@ class Shape:
             raise ValueError("place requires a Placement")
         return self.transform(placement.as_transform())
 
-    def warp(self, warp: Warp, *, bounds=None) -> Shape:
+    def warp(self, warp: Warp, *, bounds=None) -> Field:
         """Apply a nonlinear map; supply enclosing bounds for bounds queries/rendering."""
         from .bounds import as_aabb
 
         if not isinstance(warp, Warp) or warp.dim != self.dim:
-            raise ValueError("shape and warp dimensions must match")
+            raise ValueError("field and warp dimensions must match")
         bounds = None if bounds is None else as_aabb(bounds, self.dim)
-        return Shape("warp", self.dim, WarpPayload(warp, bounds), (self,))
+        return Field("warp", self.dim, WarpPayload(warp, bounds), (self,))
 
-    def slice(self, plane: Plane) -> Shape:
+    def slice(self, plane: Plane) -> Field:
         """Restrict a 3D field exactly to plane-local (x, y), without redistancing."""
         if self.dim != 3 or not isinstance(plane, Plane):
-            raise ValueError("slice requires a 3D shape and a Plane")
-        return Shape("slice", 2, Slice(plane), (self,))
+            raise ValueError("slice requires a 3D field and a Plane")
+        return Field("slice", 2, Slice(plane), (self,))
 
     def contours(self, bounds, *, resolution=128, step=None):
         """Sample a 2D field's zero contours in its local coordinates."""
@@ -192,35 +192,35 @@ class Shape:
         """Place this 2D profile's (x, y) coordinates on a plane."""
         return Sketch(self, plane)
 
-    def offset(self, amount: float) -> Shape:
-        return Shape("offset", self.dim, Offset(_number(amount)), (self,))
+    def offset(self, amount: float) -> Field:
+        return Field("offset", self.dim, Offset(_number(amount)), (self,))
 
-    def shell(self, thickness: float) -> Shape:
+    def shell(self, thickness: float) -> Field:
         if self.dim != 3:
             raise ValueError("shell requires a 3D solid")
-        return Shape("shell", 3, Shell(_positive(thickness)), (self,))
+        return Field("shell", 3, Shell(_positive(thickness)), (self,))
 
-    def linear_pattern(self, count: int, *step: float) -> Shape:
+    def linear_pattern(self, count: int, *step: float) -> Field:
         if not isinstance(count, int) or isinstance(count, bool) or count < 1:
             raise ValueError("pattern count must be a positive integer")
         delta = _point(_vector_args(step), self.dim)
-        return Shape("linear_pattern", self.dim, LinearPattern(count, delta), (self,))
+        return Field("linear_pattern", self.dim, LinearPattern(count, delta), (self,))
 
-    def radial_pattern(self, count: int, axis: str = "z") -> Shape:
+    def radial_pattern(self, count: int, axis: str = "z") -> Field:
         if self.dim != 3 or not isinstance(count, int) or isinstance(count, bool) or count < 1:
             raise ValueError("radial pattern requires a 3D solid and positive count")
-        return Shape("radial_pattern", 3, RadialPattern(count, axis), (self,))
+        return Field("radial_pattern", 3, RadialPattern(count, axis), (self,))
 
-    def with_material(self, material_id: int) -> Shape:
+    def with_material(self, material_id: int) -> Field:
         if self.dim != 3:
-            raise ValueError("with_material requires a 3D shape")
-        return Shape("material", 3, Material(validate_material_id(material_id)), (self,))
+            raise ValueError("with_material requires a 3D field")
+        return Field("material", 3, Material(validate_material_id(material_id)), (self,))
 
-    def named(self, name: str) -> Shape:
+    def named(self, name: str) -> Field:
         """Add a feature scope, preserving the names of constituent features."""
         if not isinstance(name, str) or not name.isidentifier():
             raise ValueError("feature name must be a Python identifier")
-        return Shape("feature", self.dim, Feature(name), (self,))
+        return Field("feature", self.dim, Feature(name), (self,))
 
     def ray_cast(self, origin, direction, **kwargs):
         from .query import ray_cast
@@ -239,7 +239,7 @@ class Shape:
 
     def extrude(
         self, height, *, offset=0.0, bounds=None, height_lipschitz=None, offset_lipschitz=None
-    ) -> Shape:
+    ) -> Field:
         """Extrude along Z; constant height spans offset +/- height/2 (Z=0 by default).
 
         Height and offset may be symbolic functions of (x, y). Heights are full
@@ -260,7 +260,7 @@ class Shape:
             offset_lipschitz=offset_lipschitz,
         )
 
-    def loft(self, stations: Iterable[LoftStation], *, axis="z") -> Shape:
+    def loft(self, stations: Iterable[LoftStation], *, axis="z") -> Field:
         """Linearly interpolate one profile's offsets and scales at LoftStations.
 
         Returns a flat-capped implicit distance estimate;
@@ -270,7 +270,7 @@ class Shape:
 
         return loft(self, stations, axis=axis)
 
-    def sweep(self, curve, *, tolerance=0.01, up=None, closed=False) -> Shape:
+    def sweep(self, curve, *, tolerance=0.01, up=None, closed=False) -> Field:
         """Sweep along a 2D/3D curve with transported frames and mitered joins.
 
         Near-reversals and closed paths requiring extra frame twist are rejected.
@@ -279,7 +279,7 @@ class Shape:
 
         return sweep(self, curve, tolerance=tolerance, up=up, closed=closed)
 
-    def revolve(self, *, axis: str) -> Shape:
+    def revolve(self, *, axis: str) -> Field:
         """Revolve around the profile's X or Y axis on the default XY plane."""
         return self.on(Plane.xy()).revolve(axis=axis)
 
@@ -288,18 +288,18 @@ class Shape:
 class Sketch:
     """A 2D profile embedded in a 3D plane, ready for a solid operation."""
 
-    profile: Shape
+    profile: Field
     plane: Plane
 
     def __post_init__(self):
-        if not isinstance(self.profile, Shape) or self.profile.dim != 2:
+        if not isinstance(self.profile, Field) or self.profile.dim != 2:
             raise ValueError("sketch requires a 2D profile")
         if not isinstance(self.plane, Plane):
             raise ValueError("sketch requires a Plane")
 
     def extrude(
         self, height, *, offset=0.0, bounds=None, height_lipschitz=None, offset_lipschitz=None
-    ) -> Shape:
+    ) -> Field:
         """Extrude along the plane normal, centered at offset +/- height/2.
 
         Fields receive profile-local (x, y); bounds use (x, y, normal) coordinates.
@@ -312,7 +312,7 @@ class Sketch:
             offset_lipschitz=offset_lipschitz,
         ).transform(self.plane.as_transform())
 
-    def revolve(self, *, axis: str) -> Shape:
+    def revolve(self, *, axis: str) -> Field:
         """Revolve around the plane's local X or Y axis through its origin."""
         if axis not in ("x", "y"):
             raise ValueError("revolution axis must be sketch-local x or y")
@@ -320,7 +320,7 @@ class Sketch:
         if axis == "x":
             profile = profile.transform(Transform(((0.0, 1.0), (1.0, 0.0))))
         profile = profile | profile.transform(Transform.scaling(-1, 1))
-        solid = Shape("revolve", 3, Empty(), (profile,))
+        solid = Field("revolve", 3, Empty(), (profile,))
         radial, axial = (
             (self.plane.y_direction, self.plane.x_direction)
             if axis == "x"
@@ -331,14 +331,14 @@ class Sketch:
         return solid.place(Placement(self.plane.origin, rotation_matrix=rotation))
 
 
-def _same_dim(a: Shape, b: Shape) -> None:
-    if not isinstance(a, Shape) or not isinstance(b, Shape) or a.dim != b.dim:
-        raise ValueError("Boolean operands must be shapes of the same dimension")
+def _same_dim(a: Field, b: Field) -> None:
+    if not isinstance(a, Field) or not isinstance(b, Field) or a.dim != b.dim:
+        raise ValueError("Boolean operands must be fields of the same dimension")
 
 
-def _binary(kind: str, a: Shape, b: Shape) -> Shape:
+def _binary(kind: str, a: Field, b: Field) -> Field:
     _same_dim(a, b)
-    return Shape(kind, a.dim, Empty(), (a, b))
+    return Field(kind, a.dim, Empty(), (a, b))
 
 
 def _field_reduce(kind: str, fields):
@@ -346,17 +346,17 @@ def _field_reduce(kind: str, fields):
         fields = tuple(fields[0])
     if not fields:
         raise ValueError(f"{kind}_ needs at least one field")
-    if any(isinstance(field, Shape) for field in fields):
-        if not all(isinstance(field, Shape) for field in fields):
-            raise TypeError("cannot combine shapes and scalar fields")
+    if any(isinstance(field, Field) for field in fields):
+        if not all(isinstance(field, Field) for field in fields):
+            raise TypeError("cannot combine distance fields and scalar fields")
         leaves = []
 
-        def collect(shape):
-            if shape.kind == kind:
-                for child in shape.children:
+        def collect(field):
+            if field.kind == kind:
+                for child in field.children:
                     collect(child)
             else:
-                leaves.append(shape)
+                leaves.append(field)
 
         for field in fields:
             collect(field)
@@ -392,23 +392,23 @@ def max_(*fields):
     return _field_reduce("max", fields)
 
 
-def _custom_count(shape: Shape) -> int:
-    return (shape.kind == "custom") + sum(_custom_count(child) for child in shape.children)
+def _custom_count(field: Field) -> int:
+    return (field.kind == "custom") + sum(_custom_count(child) for child in field.children)
 
 
 # Sketch primitives use the XY plane. Extrusion is centered on Z.
-def circle(radius: float) -> Shape:
-    return Shape("circle", 2, Radius(_positive(radius)))
+def circle(radius: float) -> Field:
+    return Field("circle", 2, Radius(_positive(radius)))
 
 
-def rectangle(width: float, height: float, corner_radius: float = 0) -> Shape:
+def rectangle(width: float, height: float, corner_radius: float = 0) -> Field:
     w, h, r = _positive(width), _positive(height), _number(corner_radius)
     if r < 0 or r > min(w, h) / 2:
         raise ValueError("corner radius must fit inside the rectangle")
-    return Shape("rectangle", 2, Rectangle(w, h, r))
+    return Field("rectangle", 2, Rectangle(w, h, r))
 
 
-def polygon(points: Iterable[Iterable[float]]) -> Shape:
+def polygon(points: Iterable[Iterable[float]]) -> Field:
     pts = tuple(_point(p, 2) for p in points)
     if len(pts) < 3 or len(set(pts)) < 3:
         raise ValueError("polygon needs three distinct points")
@@ -416,10 +416,10 @@ def polygon(points: Iterable[Iterable[float]]) -> Shape:
         pts = pts[:-1]
     if any(pts[i] == pts[(i + 1) % len(pts)] for i in range(len(pts))):
         raise ValueError("polygon has a zero-length edge")
-    return Shape("polygon", 2, Polygon(pts))
+    return Field("polygon", 2, Polygon(pts))
 
 
-def field_morph(sections, *, axis="z") -> Shape:
+def field_morph(sections, *, axis="z") -> Field:
     """Blend fields at (position, 2D profile) sections into a flat-capped solid.
 
     Linear interpolation at fixed transverse coordinates can erase interiors.
@@ -431,34 +431,34 @@ def field_morph(sections, *, axis="z") -> Shape:
 
 
 # Solid primitives use Z as their main axis and are centered at the origin.
-def sphere(radius: float) -> Shape:
-    return Shape("sphere", 3, Radius(_positive(radius)))
+def sphere(radius: float) -> Field:
+    return Field("sphere", 3, Radius(_positive(radius)))
 
 
-def box(width: float, depth: float, height: float, corner_radius: float = 0) -> Shape:
+def box(width: float, depth: float, height: float, corner_radius: float = 0) -> Field:
     w, d, h, r = _positive(width), _positive(depth), _positive(height), _number(corner_radius)
     if r < 0 or r > min(w, d, h) / 2:
         raise ValueError("corner radius must fit inside the box")
-    return Shape("box", 3, Box(w, d, h, r))
+    return Field("box", 3, Box(w, d, h, r))
 
 
-def cylinder(radius: float, height: float) -> Shape:
-    return Shape("cylinder", 3, Cylinder(_positive(radius), _positive(height)))
+def cylinder(radius: float, height: float) -> Field:
+    return Field("cylinder", 3, Cylinder(_positive(radius), _positive(height)))
 
 
-def torus(major_radius: float, tube_radius: float) -> Shape:
+def torus(major_radius: float, tube_radius: float) -> Field:
     major, tube = _positive(major_radius), _positive(tube_radius)
-    return Shape("torus", 3, Torus(major, tube))
+    return Field("torus", 3, Torus(major, tube))
 
 
-def capsule(start: Iterable[float], end: Iterable[float], radius: float) -> Shape:
+def capsule(start: Iterable[float], end: Iterable[float], radius: float) -> Field:
     a, b = _point(start, 3), _point(end, 3)
     if a == b:
         raise ValueError("capsule endpoints must differ")
-    return Shape("capsule", 3, Capsule(a, b, _positive(radius)))
+    return Field("capsule", 3, Capsule(a, b, _positive(radius)))
 
 
-def custom_sdf(fn, dim: int = 3, material_id: int = 0, *, lipschitz: float, bounds=None) -> Shape:
+def custom_sdf(fn, dim: int = 3, material_id: int = 0, *, lipschitz: float, bounds=None) -> Field:
     """Capture a renderable scalar field; bounds enclose f <= 0 locally.
 
     The callable receives symbolic coordinates once. Its result must be a
@@ -490,4 +490,4 @@ def custom_sdf(fn, dim: int = 3, material_id: int = 0, *, lipschitz: float, boun
             "custom_sdf callable must return a renderable scalar field; "
             "use symbolic coordinates and sdf_kernel.math operations"
         ) from exc
-    return Shape("custom", dim, Custom(distance, material, bounds, lipschitz))
+    return Field("custom", dim, Custom(distance, material, bounds, lipschitz))

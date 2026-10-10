@@ -6,8 +6,8 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from math import atan2, cos, hypot, pi, sin, sqrt
 
-from .dsl import Shape, _number, _point, _positive
-from .shape_payloads import CurveProfile, Tube
+from .dsl import Field, _number, _point, _positive
+from .field_payloads import CurveProfile, Tube
 from .transform import _vector_args
 
 
@@ -221,15 +221,15 @@ class Curve:
             for a, b in zip(points, points[1:], strict=False)
         )
 
-    def close(self) -> Shape:
+    def close(self) -> Field:
         if self.dim != 2:
             raise ValueError("only 2D curves can be closed into a profile")
         if not self.segments:
             raise ValueError("a profile needs at least one curve segment")
         self.line_to(*self.start)
-        return Shape("curve_profile", 2, CurveProfile(tuple(self.segments)))
+        return Field("curve_profile", 2, CurveProfile(tuple(self.segments)))
 
-    def tube(self, radius: float, tolerance: float | None = None, *, closed: bool = False) -> Shape:
+    def tube(self, radius: float, tolerance: float | None = None, *, closed: bool = False) -> Field:
         if self.dim != 3 or not self.segments:
             raise ValueError("a tube needs a 3D curve with at least one segment")
         radius = _positive(radius)
@@ -238,9 +238,9 @@ class Curve:
             points += (points[0],)
         if len(points) < 2:
             raise ValueError("tube curve has no length")
-        return Shape("tube", 3, Tube(points, radius))
+        return Field("tube", 3, Tube(points, radius))
 
-    def sweep(self, profile: Shape, *, tolerance=0.01, up=None, closed=False) -> Shape:
+    def sweep(self, profile: Field, *, tolerance=0.01, up=None, closed=False) -> Field:
         """Sweep a 2D profile; up selects its initial local Y direction.
 
         Near-reversals and closed paths requiring extra frame twist are rejected.

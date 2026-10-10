@@ -122,10 +122,10 @@ def _slice_bounds(box, plane):
     )
 
 
-def _analytic(shape, level=0.0):
+def _analytic(field, level=0.0):
     """Bound {p: field(p) <= level}; carry offsets through distance scaling."""
-    kind, data, dim = shape.kind, shape.data, shape.dim
-    child = shape.children[0] if shape.children else None
+    kind, data, dim = field.kind, field.data, field.dim
+    child = field.children[0] if field.children else None
     padding = max(0.0, level)
     if kind in ("sphere", "circle"):
         return _centered((data.radius + padding,) * dim)
@@ -169,7 +169,7 @@ def _analytic(shape, level=0.0):
         a = _analytic(child, threshold)
         if kind == "subtract":
             return a
-        b = _analytic(shape.children[1], threshold)
+        b = _analytic(field.children[1], threshold)
         return a.intersection(b) if kind == "max" else a.union(b)
     if kind == "offset":
         return _analytic(child, level + data.amount)
@@ -215,11 +215,11 @@ def _analytic(shape, level=0.0):
     if kind in ("field_morph", "loft", "variable_extrude"):
         from .operations import operation_bounds
 
-        return operation_bounds(shape, level, _analytic)
+        return operation_bounds(field, level, _analytic)
     if kind == "profile_sweep":
         from .sweep import sweep_bounds
 
-        return sweep_bounds(shape, level, _analytic)
+        return sweep_bounds(field, level, _analytic)
     if kind == "extrude":
         box = _analytic(child, level)
         if box.is_empty:
@@ -238,16 +238,16 @@ def _analytic(shape, level=0.0):
     return _unknown(dim)
 
 
-def shape_bounds(shape, scene_bounds=None, *, tolerance=0.01, max_cells=65536):
+def field_bounds(field, scene_bounds=None, *, tolerance=0.01, max_cells=65536):
     """Return analytic bounds, clipped to a supplied region when needed."""
     tolerance = float(tolerance)
     if not isfinite(tolerance) or tolerance <= 0:
         raise ValueError("bounds tolerance must be positive and finite")
     if not isinstance(max_cells, int) or isinstance(max_cells, bool) or max_cells < 1:
         raise ValueError("max_cells must be a positive integer")
-    analytic = _analytic(shape)
+    analytic = _analytic(field)
     if analytic.is_empty or all(isfinite(x) for x in analytic.minimum + analytic.maximum):
         return analytic
     if scene_bounds is None:
         raise ValueError("unresolved geometry needs explicit custom bounds or scene_bounds")
-    return as_aabb(scene_bounds, shape.dim).intersection(analytic)
+    return as_aabb(scene_bounds, field.dim).intersection(analytic)

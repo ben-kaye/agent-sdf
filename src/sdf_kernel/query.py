@@ -8,7 +8,7 @@ from math import cos, isfinite, radians, sin, sqrt, tan
 import numpy as np
 
 from .camera import _orientation, _orientation_up
-from .dsl import Shape
+from .dsl import Field
 from .model import compile_scene
 
 
@@ -31,12 +31,12 @@ def _vector(value, label):
     return vector
 
 
-def _distance(shape, point):
-    return float(shape.sample(point)[0])
+def _distance(field, point):
+    return float(field.sample(point)[0])
 
 
-def _sample(shape, point):
-    distance, material = shape.sample(point)
+def _sample(field, point):
+    distance, material = field.sample(point)
     return float(distance), int(material)
 
 
@@ -53,10 +53,10 @@ def _rotate_back(point, angle, axis, dim):
     return np.array((c * x + s * y, -s * x + c * y, z))
 
 
-def _contributors(shape, point):
+def _contributors(field, point):
     """Return primary and optional blend contributor at a world-space point."""
-    kind, data = shape.kind, shape.data
-    children = shape.children
+    kind, data = field.kind, field.data
+    children = field.children
     if kind == "feature":
         inner = _contributors(children[0], point)
         return tuple(f"{data.name}/{name}" for name in inner) if inner else (data.name,)
@@ -135,10 +135,10 @@ def _contributors(shape, point):
     return _contributors(child, point)
 
 
-def _clip_ray(shape, origin, direction, max_distance, tolerance):
+def _clip_ray(field, origin, direction, max_distance, tolerance):
     near, far = 0.0, max_distance
     try:
-        bounds = shape.bounds()
+        bounds = field.bounds()
     except ValueError:
         return near, far
     if bounds.is_empty:
@@ -158,13 +158,13 @@ def _clip_ray(shape, origin, direction, max_distance, tolerance):
     return near, far
 
 
-def _cast_shape(shape, origin, direction, max_distance, tolerance):
+def _cast_field(field, origin, direction, max_distance, tolerance):
     """Cast one independent solid so another solid cannot hide its surface."""
-    near, far = _clip_ray(shape, origin, direction, max_distance, tolerance)
+    near, far = _clip_ray(field, origin, direction, max_distance, tolerance)
     if near > far:
         return None
     travel = near
-    distance = _distance(shape, origin + travel * direction)
+    distance = _distance(field, origin + travel * direction)
     if not isfinite(distance):
         return None
     hit_t = None
@@ -175,7 +175,7 @@ def _cast_shape(shape, origin, direction, max_distance, tolerance):
         next_t = min(travel + max(abs(distance) * 0.75, tolerance), far)
         if next_t <= travel:
             break
-        next_distance = _distance(shape, origin + next_t * direction)
+        next_distance = _distance(field, origin + next_t * direction)
         if not isfinite(next_distance):
             break
         if (distance < 0) != (next_distance < 0):
@@ -183,7 +183,7 @@ def _cast_shape(shape, origin, direction, max_distance, tolerance):
             low_d = distance
             for _ in range(32):
                 middle = (low + high) * 0.5
-                middle_d = _distance(shape, origin + middle * direction)
+                middle_d = _distance(field, origin + middle * direction)
                 if (low_d < 0) == (middle_d < 0):
                     low, low_d = middle, middle_d
                 else:
@@ -197,8 +197,8 @@ def _cast_shape(shape, origin, direction, max_distance, tolerance):
     epsilon = max(tolerance * 2, 1e-5)
     gradient = np.array(
         [
-            _distance(shape, point + np.eye(3)[axis] * epsilon)
-            - _distance(shape, point - np.eye(3)[axis] * epsilon)
+            _distance(field, point + np.eye(3)[axis] * epsilon)
+            - _distance(field, point - np.eye(3)[axis] * epsilon)
             for axis in range(3)
         ]
     )
@@ -208,8 +208,8 @@ def _cast_shape(shape, origin, direction, max_distance, tolerance):
         tuple(float(v) for v in point),
         tuple(float(v) for v in normal),
         float(hit_t),
-        _sample(shape, point)[1],
-        _contributors(shape, point),
+        _sample(field, point)[1],
+        _contributors(field, point),
     )
 
 
@@ -224,11 +224,11 @@ def _local_feature(name, path):
     return name
 
 
-def ray_cast(shape_or_scene, origin, direction, *, max_distance=100.0, tolerance=1e-4):
+def ray_cast(field_or_scene, origin, direction, *, max_distance=100.0, tolerance=1e-4):
     """Return the first surface crossing and its instance identity."""
-    compiled = compile_scene(shape_or_scene)
-    if not isinstance(compiled.shape, Shape) or compiled.shape.dim != 3:
-        raise ValueError("ray_cast needs a 3D Shape, Part, Assembly, or Scene")
+    compiled = compile_scene(field_or_scene)
+    if not isinstance(compiled.field, Field) or compiled.field.dim != 3:
+        raise ValueError("ray_cast needs a 3D Field, Part, Assembly, or Scene")
     origin, direction = _vector(origin, "origin"), _vector(direction, "direction")
     length = np.linalg.norm(direction)
     if length == 0:
@@ -240,7 +240,7 @@ def ray_cast(shape_or_scene, origin, direction, *, max_distance=100.0, tolerance
     material_names = {value["id"]: name for name, value in compiled.materials.items()}
     nearest = None
     for part in compiled.parts:
-        hit = _cast_shape(part.shape, origin, direction, max_distance, tolerance)
+        hit = _cast_field(part.field, origin, direction, max_distance, tolerance)
         if hit is None:
             continue
         point, normal, distance, material_id, names = hit
@@ -266,7 +266,7 @@ def ray_cast(shape_or_scene, origin, direction, *, max_distance=100.0, tolerance
 
 
 def pick(
-    shape_or_scene,
+    field_or_scene,
     x,
     y,
     width,
@@ -338,7 +338,7 @@ def pick(
     origin = eye + offset if fov == 0 else eye
     direction = forward if fov == 0 else forward + offset
     return ray_cast(
-        shape_or_scene, origin, direction, max_distance=max_distance, tolerance=tolerance
+        field_or_scene, origin, direction, max_distance=max_distance, tolerance=tolerance
     )
 
 

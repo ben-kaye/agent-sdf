@@ -11,27 +11,27 @@ import numpy as np
 from .bounds import AABB
 
 if TYPE_CHECKING:
-    from .dsl import Shape
+    from .dsl import Field
 
 
 @dataclass(frozen=True)
 class BVHNode:
     bounds: AABB
     children: tuple[BVHNode, ...] = ()
-    shapes: tuple[Shape, ...] = ()
+    fields: tuple[Field, ...] = ()
 
     @property
     def is_leaf(self) -> bool:
         return not self.children
 
 
-def _union_components(shape: Shape) -> list[Shape]:
+def _union_components(field: Field) -> list[Field]:
     """Flatten unions through point maps and labels, preserving other CSG."""
-    from .dsl import Shape
+    from .dsl import Field
 
     distributive = {"transform", "slice", "warp", "material", "feature"}
     components = []
-    pending = [(shape, ())]
+    pending = [(field, ())]
     while pending:
         current, wrappers = pending.pop()
         if current.kind == "min":
@@ -40,26 +40,26 @@ def _union_components(shape: Shape) -> list[Shape]:
             pending.append((current.children[0], (*wrappers, current)))
         else:
             for wrapper in reversed(wrappers):
-                current = Shape(wrapper.kind, wrapper.dim, wrapper.data, (current,))
+                current = Field(wrapper.kind, wrapper.dim, wrapper.data, (current,))
             components.append(current)
     return components
 
 
-def _certified_box(shape: Shape):
+def _certified_box(field: Field):
     """Return a box when distance to it is a lower bound outside it.
 
     This deliberately excludes custom fields and distance estimates: a bound
     on their zero set does not bound their field value at a query point.
     """
-    if shape.kind in {"sphere", "box", "cylinder", "torus", "capsule", "tube"}:
+    if field.kind in {"sphere", "box", "cylinder", "torus", "capsule", "tube"}:
         pass
-    elif shape.kind in {"linear_pattern", "radial_pattern", "material", "feature"}:
-        if _certified_box(shape.children[0]) is None:
+    elif field.kind in {"linear_pattern", "radial_pattern", "material", "feature"}:
+        if _certified_box(field.children[0]) is None:
             return None
-    elif shape.kind == "transform":
-        transform = shape.data.transform
+    elif field.kind == "transform":
+        transform = field.data.transform
         matrix = getattr(transform, "matrix", None)
-        if matrix is None or _certified_box(shape.children[0]) is None:
+        if matrix is None or _certified_box(field.children[0]) is None:
             return None
         singular_values = np.linalg.svd(np.asarray(matrix, dtype=float), compute_uv=False)
         if not np.allclose(singular_values, singular_values[0], rtol=1e-10, atol=0):
@@ -67,7 +67,7 @@ def _certified_box(shape: Shape):
     else:
         return None
     try:
-        box = shape.bounds()
+        box = field.bounds()
     except ValueError:
         return None
     if box.is_empty or not all(isfinite(x) for x in box.minimum + box.maximum):
@@ -87,7 +87,7 @@ def _build(components, dim, leaf_size):
         return BVHNode(AABB((inf,) * dim, (-inf,) * dim))
     box = _enclose([item[1] for item in components])
     if len(components) <= leaf_size:
-        return BVHNode(box, shapes=tuple(item[0] for item in components))
+        return BVHNode(box, fields=tuple(item[0] for item in components))
     spread = [
         max(item[2][axis] for item in components) - min(item[2][axis] for item in components)
         for axis in range(dim)
@@ -105,7 +105,7 @@ def _build(components, dim, leaf_size):
 
 
 def build_bvh(
-    shape: Shape,
+    field: Field,
     scene_bounds: AABB | tuple | None = None,
     *,
     tolerance: float = 0.01,
@@ -117,7 +117,7 @@ def build_bvh(
         raise ValueError("leaf_size must be a positive integer")
 
     components = []
-    for component in _union_components(shape):
+    for component in _union_components(field):
         box = component.bounds(scene_bounds, tolerance=tolerance, max_cells=max_cells)
         if box.is_empty:
             continue
@@ -126,20 +126,20 @@ def build_bvh(
             raise ValueError("BVH components must have finite bounds")
         components.append((component, box, center))
 
-    return _build(components, shape.dim, leaf_size)
+    return _build(components, field.dim, leaf_size)
 
 
-def compile_bvh_sample(shape: Shape, reference_point=None):
+def compile_bvh_sample(field: Field, reference_point=None):
     """Return a NumPy sampler that prunes certified union components."""
     import numpy as np
 
-    components = _union_components(shape)
+    components = _union_components(field)
     certified = [
         (i, component, _certified_box(component)) for i, component in enumerate(components)
     ]
     certified = [(i, component, box) for i, component, box in certified if box is not None]
     if len(certified) < 4:
-        return lambda points, active=None: shape.sample(points)
+        return lambda points, active=None: field.sample(points)
 
     indexed = {id(component): i for i, component, _ in certified if i != 0}
     entries = []
@@ -148,7 +148,7 @@ def compile_bvh_sample(shape: Shape, reference_point=None):
             continue
         center = tuple((a + b) / 2 for a, b in zip(box.minimum, box.maximum, strict=True))
         entries.append((component, box, center))
-    tree = _build(entries, shape.dim, 1)
+    tree = _build(entries, field.dim, 1)
     indexed_ids = set(indexed.values())
     ordinary = [
         (i, component) for i, component in enumerate(components[1:], 1) if i not in indexed_ids
@@ -156,9 +156,9 @@ def compile_bvh_sample(shape: Shape, reference_point=None):
 
     def sample(points, active=None):
         p = np.asarray(points)
-        if p.shape[-1] != shape.dim:
-            raise ValueError(f"expected points with {shape.dim} coordinates")
-        flat = p.reshape(-1, shape.dim)
+        if p.shape[-1] != field.dim:
+            raise ValueError(f"expected points with {field.dim} coordinates")
+        flat = p.reshape(-1, field.dim)
         distance, material = components[0].sample(flat)
         best = np.array(distance, copy=True)
         materials = np.array(material, copy=True)
@@ -194,7 +194,7 @@ def compile_bvh_sample(shape: Shape, reference_point=None):
                 for child in node.children:
                     visit(child, selected)
             else:
-                for component in node.shapes:
+                for component in node.fields:
                     evaluate(indexed[id(component)], component, selected)
 
         visit(tree, all_points)

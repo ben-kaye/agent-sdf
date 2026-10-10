@@ -2,8 +2,8 @@
 
 import numpy as np
 
-from .dsl import LoftStation, Shape, _number, _positive
-from .shape_payloads import Extrude, FieldMorph, Loft, VariableExtrude
+from .dsl import Field, LoftStation, _number, _positive
+from .field_payloads import Extrude, FieldMorph, Loft, VariableExtrude
 
 
 def _axes(axis, operation):
@@ -18,7 +18,7 @@ def _positions(values, operation):
         raise ValueError(f"{operation} needs at least two strictly increasing station positions")
 
 
-def field_morph(sections, *, axis="z") -> Shape:
+def field_morph(sections, *, axis="z") -> Field:
     """Interpolate 2D signed fields at (position, profile) sections, with flat caps.
 
     This implicit morph is a distance estimate; use profile.loft for interpolated
@@ -28,17 +28,17 @@ def field_morph(sections, *, axis="z") -> Shape:
     sections = tuple(sections)
     positions, profiles = [], []
     for position, profile in sections:
-        if not isinstance(profile, Shape) or profile.dim != 2:
-            raise ValueError("field_morph sections must be 2D shapes")
+        if not isinstance(profile, Field) or profile.dim != 2:
+            raise ValueError("field_morph sections must be 2D fields")
         positions.append(_number(position))
         profiles.append(profile)
     _positions(positions, "field_morph")
-    return Shape("field_morph", 3, FieldMorph(tuple(positions), axes), tuple(profiles))
+    return Field("field_morph", 3, FieldMorph(tuple(positions), axes), tuple(profiles))
 
 
-def loft(profile, stations, *, axis="z") -> Shape:
+def loft(profile, stations, *, axis="z") -> Field:
     """Linearly interpolate profile offsets and positive axis scales between stations."""
-    if not isinstance(profile, Shape) or profile.dim != 2:
+    if not isinstance(profile, Field) or profile.dim != 2:
         raise ValueError("loft requires a 2D profile")
     axes = _axes(axis, "loft")
     stations = tuple(stations)
@@ -46,7 +46,7 @@ def loft(profile, stations, *, axis="z") -> Shape:
         raise ValueError("loft stations must be LoftStation values")
     _positions([station.position for station in stations], "loft")
     stations = tuple((station.position, *station.offset, *station.scale) for station in stations)
-    return Shape("loft", 3, Loft(stations, axes), (profile,))
+    return Field("loft", 3, Loft(stations, axes), (profile,))
 
 
 def extrude(
@@ -63,9 +63,9 @@ def extrude(
     ):
         raise ValueError("extrusion gradient bounds must be nonnegative")
     if not callable(height) and not callable(offset) and bounds is None:
-        return Shape("extrude", 3, Extrude(height, offset), (profile,))
+        return Field("extrude", 3, Extrude(height, offset), (profile,))
     bounds = None if bounds is None else as_aabb(bounds, 3)
-    return Shape(
+    return Field(
         "variable_extrude",
         3,
         VariableExtrude(height, offset, bounds, height_lipschitz, offset_lipschitz),

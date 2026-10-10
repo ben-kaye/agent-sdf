@@ -8,8 +8,8 @@ from math import isfinite, sqrt
 import numpy as np
 
 from .curves import Curve
-from .dsl import Shape, _point
-from .shape_payloads import Sweep
+from .dsl import Field, _point
+from .field_payloads import Sweep
 
 
 def _dot(a, b):
@@ -98,14 +98,14 @@ def _miters(frames, closed):
     return (tangents[0], *joints), (*joints, tangents[-1])
 
 
-def sweep(profile: Shape, curve: Curve, *, tolerance=0.01, up=None, closed=False) -> Shape:
+def sweep(profile: Field, curve: Curve, *, tolerance=0.01, up=None, closed=False) -> Field:
     """Approximate a transported profile sweep with mitered straight spans.
 
     The returned field preserves solid sign and materials. At bends its value is
     an implicit distance estimate, rather than an exact Euclidean distance.
     Near-reversals and closed paths requiring extra frame twist are rejected.
     """
-    if not isinstance(profile, Shape) or profile.dim != 2:
+    if not isinstance(profile, Field) or profile.dim != 2:
         raise ValueError("sweep needs a 2D profile")
     if not isinstance(curve, Curve) or not curve.segments:
         raise ValueError("sweep needs a nonempty Curve")
@@ -135,7 +135,7 @@ def sweep(profile: Shape, curve: Curve, *, tolerance=0.01, up=None, closed=False
         raise ValueError("sweep curve needs more than 8192 spans")
     points = tuple(points)
     frames = _frames(points, up, closed)
-    return Shape("profile_sweep", 3, Sweep(points, frames, tolerance, closed), (profile,))
+    return Field("profile_sweep", 3, Sweep(points, frames, tolerance, closed), (profile,))
 
 
 def evaluate_sweep(node, q, evaluate):

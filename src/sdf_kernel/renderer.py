@@ -205,13 +205,13 @@ def _render_chunked(compiled, config, width, height):
     start = 0
     while start < len(parts):
         end = min(start + 100, len(parts))
-        shape = min_(*(part.shape for part in parts[start:end]))
-        while _node_count(shape) > 900 and end > start + 1:
+        field = min_(*(part.field for part in parts[start:end]))
+        while _node_count(field) > 900 and end > start + 1:
             end = start + (end - start) // 2
-            shape = min_(*(part.shape for part in parts[start:end]))
-        group = CompiledScene(shape, compiled.materials, parts[start:end])
+            field = min_(*(part.field for part in parts[start:end]))
+        group = CompiledScene(field, compiled.materials, parts[start:end])
         shader = compile_glsl(group)
-        part_config = {**config, "bounds": _scene_bounds(shape)}
+        part_config = {**config, "bounds": _scene_bounds(field)}
         color = _render_webgl(shader, {**part_config, "captureMode": 1}, width, height)
         depth = _render_webgl(shader, {**part_config, "captureMode": 2}, width, height)
         layers.append(np.asarray(color, dtype=np.uint8))
@@ -252,7 +252,7 @@ def render(
 ):
     """Render a scene with the same GLSL program used by the browser viewer."""
     compiled = compile_scene(scene)
-    scene = compiled.shape
+    scene = compiled.field
     materials = scene_materials(compiled.materials, materials)
     if scene.dim != 3:
         raise ValueError("render needs a 3D scene")

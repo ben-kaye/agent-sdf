@@ -182,11 +182,11 @@ def _curve_profile(p, segments):
     return np.where(inside, -distance, distance)
 
 
-def evaluate_shape(shape, points):
+def evaluate_field(field, points):
     """Return distance and material arrays for points with a final coordinate axis."""
     p = np.asarray(points)
-    if p.shape[-1] != shape.dim:
-        raise ValueError(f"expected points with {shape.dim} coordinates")
+    if p.shape[-1] != field.dim:
+        raise ValueError(f"expected points with {field.dim} coordinates")
 
     def evaluate(node, q):
         kind, data = node.kind, node.data
@@ -321,6 +321,6 @@ def evaluate_shape(shape, points):
         if kind == "revolve":
             profile = np.stack((_length(q[..., :2]), q[..., 2]), axis=-1)
             return evaluate(child, profile)
-        raise ValueError(f"unknown shape kind: {kind}")
+        raise ValueError(f"unknown field kind: {kind}")
 
-    return evaluate(shape, p)
+    return evaluate(field, p)

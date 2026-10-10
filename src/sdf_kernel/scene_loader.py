@@ -5,7 +5,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-from .dsl import Shape
+from .dsl import Field
 from .materials import scene_materials
 from .model import Assembly, CompiledScene, Instance, Part, Scene, compile_scene
 
@@ -13,8 +13,8 @@ from .model import Assembly, CompiledScene, Instance, Part, Scene, compile_scene
 @dataclass(frozen=True)
 class LoadedScene:
     source: Path
-    scene: Shape
-    object: Shape | Part | Assembly | Scene | Instance | CompiledScene
+    scene: Field
+    object: Field | Part | Assembly | Scene | Instance | CompiledScene
     compiled: CompiledScene
     materials: dict
     views: object
@@ -40,8 +40,8 @@ def load_scene(source: str | Path) -> LoadedScene:
         raise ValueError(f"{source} must define a 3D SCENE or MODEL")
 
     compiled = compile_scene(object)
-    if compiled.shape.dim != 3:
+    if compiled.field.dim != 3:
         raise ValueError(f"{source} must define a 3D SCENE or MODEL")
     materials = scene_materials(compiled.materials, namespace.get("MATERIALS"))
-    compiled = CompiledScene(compiled.shape, materials, compiled.parts)
-    return LoadedScene(source, compiled.shape, object, compiled, materials, namespace.get("VIEWS"))
+    compiled = CompiledScene(compiled.field, materials, compiled.parts)
+    return LoadedScene(source, compiled.field, object, compiled, materials, namespace.get("VIEWS"))

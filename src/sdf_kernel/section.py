@@ -8,7 +8,7 @@ from math import ceil, hypot, isfinite
 import numpy as np
 
 from .bounds import as_aabb
-from .dsl import Shape
+from .dsl import Field
 from .model import compile_scene
 from .plane import Plane
 
@@ -61,10 +61,10 @@ def _resolution(bounds, resolution, step):
     return nx, ny
 
 
-def contours(profile: Shape, bounds, *, resolution=128, step=None) -> tuple[Contour, ...]:
+def contours(profile: Field, bounds, *, resolution=128, step=None) -> tuple[Contour, ...]:
     """Trace a 2D profile's zero level set inside finite local bounds."""
-    if not isinstance(profile, Shape) or profile.dim != 2:
-        raise ValueError("contours requires a 2D Shape")
+    if not isinstance(profile, Field) or profile.dim != 2:
+        raise ValueError("contours requires a 2D Field")
     plane_bounds = as_aabb(bounds, 2)
     nx, ny = _resolution(plane_bounds, resolution, step)
     xs = np.linspace(plane_bounds.minimum[0], plane_bounds.maximum[0], nx + 1)
@@ -163,15 +163,15 @@ def contours(profile: Shape, bounds, *, resolution=128, step=None) -> tuple[Cont
     return tuple(traced)
 
 
-def section(shape_or_scene, plane: Plane, bounds, *, resolution=128, step=None) -> Section:
+def section(field_or_scene, plane: Plane, bounds, *, resolution=128, step=None) -> Section:
     """Trace a solid's zero contours in a Plane's exact local axes."""
-    shape = compile_scene(shape_or_scene).shape
-    if shape.dim != 3:
+    field = compile_scene(field_or_scene).field
+    if field.dim != 3:
         raise ValueError("section requires a 3D scene")
     if not isinstance(plane, Plane):
         raise ValueError("section requires a Plane")
     plane_bounds = as_aabb(bounds, 2)
-    local = shape.slice(plane).contours(plane_bounds, resolution=resolution, step=step)
+    local = field.slice(plane).contours(plane_bounds, resolution=resolution, step=step)
     world = tuple(
         Contour(
             tuple(plane.local_to_world(point) for point in contour.points),

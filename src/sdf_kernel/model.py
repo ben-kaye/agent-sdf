@@ -9,11 +9,11 @@ from types import MappingProxyType
 import numpy as np
 
 from .anchor import AnchorPlane
-from .dsl import Shape, min_
+from .dsl import Field, min_
+from .field_payloads import Feature
+from .field_payloads import Material as MaterialPayload
 from .materials import PALETTE, Material, validate_material_id
 from .plane import Plane
-from .shape_payloads import Feature
-from .shape_payloads import Material as MaterialPayload
 from .transform import Placement, _vector3
 
 
@@ -63,18 +63,18 @@ def _datums(values):
 
 
 class _Object:
-    def to_shape(self) -> Shape:
+    def to_field(self) -> Field:
         """Explicitly combine the placed part fields into one union field."""
-        return compile_scene(self).shape
+        return compile_scene(self).field
 
     def bounds(self, scene_bounds=None, **kwargs):
-        return self.to_shape().bounds(scene_bounds, **kwargs)
+        return self.to_field().bounds(scene_bounds, **kwargs)
 
     def extents(self, scene_bounds=None, **kwargs):
         return self.bounds(scene_bounds, **kwargs).extents
 
     def bvh(self, scene_bounds=None, **kwargs):
-        return self.to_shape().bvh(scene_bounds, **kwargs)
+        return self.to_field().bvh(scene_bounds, **kwargs)
 
     def ray_cast(self, origin, direction, **kwargs):
         from .query import ray_cast
@@ -87,7 +87,7 @@ class _Object:
         return pick(self, x, y, width, height, **kwargs)
 
     def slice(self, plane):
-        return self.to_shape().slice(plane)
+        return self.to_field().slice(plane)
 
     def section(self, plane, bounds, **kwargs):
         from .section import section
@@ -105,21 +105,21 @@ class _Placeable(_Object):
 class Part(_Placeable):
     """One local geometry expression, its materials, and exported datums."""
 
-    shape: Shape
+    field: Field
     materials: Mapping[int, Material]
     datums: Mapping
     metadata: Mapping
 
-    def __init__(self, shape, *, material=None, materials=None, datums=None, metadata=None):
-        if not isinstance(shape, Shape) or shape.dim != 3:
-            raise ValueError("a Part requires a 3D Shape")
+    def __init__(self, field, *, material=None, materials=None, datums=None, metadata=None):
+        if not isinstance(field, Field) or field.dim != 3:
+            raise ValueError("a Part requires a 3D Field")
         definitions = _mapping(materials, "materials")
         if material is not None:
             if not isinstance(material, Material):
                 raise ValueError("part material must be a Material")
             if definitions:
                 raise ValueError("provide material or local materials, not both")
-            shape = shape.with_material(0)
+            field = field.with_material(0)
             definitions = {0: material}
         named_materials = {}
         for key, value in definitions.items():
@@ -129,7 +129,7 @@ class Part(_Placeable):
             if value.name in named_materials and named_materials[value.name] != value:
                 raise ValueError(f"part material name has conflicting definitions: {value.name}")
             named_materials[value.name] = value
-        object.__setattr__(self, "shape", shape)
+        object.__setattr__(self, "field", field)
         object.__setattr__(self, "materials", MappingProxyType(definitions))
         object.__setattr__(self, "datums", _datums(datums))
         object.__setattr__(self, "metadata", MappingProxyType(_mapping(metadata, "metadata")))
@@ -237,19 +237,19 @@ class Scene(_Composition):
 @dataclass(frozen=True)
 class CompiledPart:
     path: tuple[str, ...]
-    shape: Shape
+    field: Field
     part: Part | None
     placement: Placement
 
 
 @dataclass(frozen=True)
 class CompiledScene:
-    shape: Shape
+    field: Field
     materials: dict
     parts: tuple[CompiledPart, ...]
 
 
-def _prepare_features(shape, prefix=()):
+def _prepare_features(field, prefix=()):
     """Lower nested feature scopes to leaf labels without losing constituent names."""
     cache = {}
 
@@ -260,20 +260,20 @@ def _prepare_features(shape, prefix=()):
         if node.kind == "feature":
             result = visit(node.children[0], (*scope, node.data.name))
         elif node.children:
-            result = Shape(
+            result = Field(
                 node.kind, node.dim, node.data, tuple(visit(c, scope) for c in node.children)
             )
         elif scope:
-            result = Shape("feature", node.dim, Feature("/".join(scope)), (node,))
+            result = Field("feature", node.dim, Feature("/".join(scope)), (node,))
         else:
             result = node
         cache[key] = result
         return result
 
-    return visit(shape, tuple(prefix))
+    return visit(field, tuple(prefix))
 
 
-def _remap_materials(shape, mapping):
+def _remap_materials(field, mapping):
     cache = {}
 
     def material_id(value):
@@ -299,26 +299,26 @@ def _remap_materials(shape, mapping):
             children = tuple(visit(c) for c in node.children)
         if node.kind == "custom":
             data = data._replace(material=remap_custom_material(data.material))
-        result = Shape(node.kind, node.dim, data, children)
+        result = Field(node.kind, node.dim, data, children)
         if not children and node.kind != "custom" and 0 in mapping:
-            result = Shape("material", node.dim, MaterialPayload(mapping[0]), (result,))
+            result = Field("material", node.dim, MaterialPayload(mapping[0]), (result,))
         cache[key] = result
         return result
 
-    return visit(shape)
+    return visit(field)
 
 
 def compile_scene(value) -> CompiledScene:
     """Resolve instance placements, material bindings, and qualified feature labels."""
     if isinstance(value, CompiledScene):
         return value
-    if isinstance(value, Shape):
+    if isinstance(value, Field):
         if value.dim != 3:
             raise ValueError("a scene requires 3D geometry")
-        shape = _prepare_features(value)
-        return CompiledScene(shape, {}, (CompiledPart((), shape, None, Placement()),))
+        field = _prepare_features(value)
+        return CompiledScene(field, {}, (CompiledPart((), field, None, Placement()),))
     if not isinstance(value, (Part, Assembly, Scene, Instance)):
-        raise ValueError("expected a 3D Shape, Part, Assembly, Instance, or Scene")
+        raise ValueError("expected a 3D Field, Part, Assembly, Instance, or Scene")
     parts = []
     materials = {}
     material_ids = {}
@@ -339,9 +339,9 @@ def compile_scene(value) -> CompiledScene:
                         name = "/".join((*path, material.name))
                         materials[name] = {"id": index, **material.finish()}
                     mapping[local] = material_ids[material]
-                prepared[id(obj)] = _remap_materials(obj.shape, mapping)
-            shape = _prepare_features(prepared[id(obj)], path).place(placement)
-            parts.append(CompiledPart(path, shape, obj, placement))
+                prepared[id(obj)] = _remap_materials(obj.field, mapping)
+            field = _prepare_features(prepared[id(obj)], path).place(placement)
+            parts.append(CompiledPart(path, field, obj, placement))
         else:
             key = id(obj)
             if key in active:
@@ -354,5 +354,5 @@ def compile_scene(value) -> CompiledScene:
     visit(value, (), Placement())
     if not parts:
         raise ValueError("cannot evaluate a composition containing no parts")
-    shape = min_(*(part.shape for part in parts))
-    return CompiledScene(shape, materials, tuple(parts))
+    field = min_(*(part.field for part in parts))
+    return CompiledScene(field, materials, tuple(parts))

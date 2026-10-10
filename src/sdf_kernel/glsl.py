@@ -1,4 +1,4 @@
-"""Lower the immutable Shape tree directly to GLSL ES 3.00."""
+"""Lower the immutable Field tree directly to GLSL ES 3.00."""
 
 from __future__ import annotations
 
@@ -262,16 +262,16 @@ def _lipschitz(node, box):
     elif kind in ("field_morph", "loft"):
         pass
     else:
-        raise ValueError(f"GLSL lowering does not support shape kind '{kind}'")
+        raise ValueError(f"GLSL lowering does not support field kind '{kind}'")
     if not isfinite(result) or result <= 0:
         raise ValueError("GLSL field Lipschitz bound must be finite and positive")
     return result
 
 
-def _shape_kinds(node):
+def _field_kinds(node):
     yield node.kind
     for child in node.children:
-        yield from _shape_kinds(child)
+        yield from _field_kinds(child)
 
 
 def _section_span_box(node, first, last):
@@ -573,7 +573,7 @@ def _quadratic_coefficients(segment):
 
 def feature_names(scene):
     """Return the feature ID table used by generated GLSL (index zero is unnamed)."""
-    scene = compile_scene(scene).shape
+    scene = compile_scene(scene).field
     names = [None]
     seen = set()
 
@@ -599,9 +599,9 @@ class _Lowerer:
         if key in self.names:
             return self.names[key]
         if len(self.names) >= _MAX_NODES:
-            raise ValueError(f"GLSL scene exceeds {_MAX_NODES} shape nodes")
+            raise ValueError(f"GLSL scene exceeds {_MAX_NODES} field nodes")
         children = [self.lower(child) for child in node.children]
-        name = f"shape{len(self.names)}"
+        name = f"field{len(self.names)}"
         self.names[key] = name
         dim = node.dim
         ptype = f"vec{dim}"
@@ -777,7 +777,7 @@ class _Lowerer:
                 *declarations,
                 f"return vec3({result}, {to_glsl(data.material)}, 0.0);",
             ]
-        raise ValueError(f"GLSL lowering does not support shape kind '{kind}'")
+        raise ValueError(f"GLSL lowering does not support field kind '{kind}'")
 
     def _curve_profile(self, segments):
         from .backend import _curve_y_breaks
@@ -918,14 +918,14 @@ def compile_glsl(scene, *, bvh=False):
     Set bvh to prune certified union components on the GPU.
     """
     compiled = compile_scene(scene)
-    scene = compiled.shape
+    scene = compiled.field
     if scene.dim != 3:
         raise ValueError("GLSL scene must be 3D")
     from .bounds import AABB
 
     box = scene.bounds()
     if box.is_empty or not all(isfinite(x) for x in box.minimum + box.maximum):
-        if any(kind in {"field_morph", "loft"} for kind in _shape_kinds(scene)):
+        if any(kind in {"field_morph", "loft"} for kind in _field_kinds(scene)):
             raise ValueError(
                 "GLSL loft and field_morph scenes need finite bounds for safe ray marching"
             )
@@ -938,7 +938,7 @@ def compile_glsl(scene, *, bvh=False):
     # BVH gap pruning compares raw fields with Euclidean distances. Disable
     # it for fields whose local certificate may exceed one or is box-limited.
     box_limited = {"custom", "python", "field_morph", "loft", "variable_extrude"}
-    bvh = bvh and not any(kind in box_limited for kind in _shape_kinds(scene))
+    bvh = bvh and not any(kind in box_limited for kind in _field_kinds(scene))
     if bvh:
         bvh = _lipschitz(scene, box) <= 1.0
     names = feature_names(compiled)
@@ -946,8 +946,8 @@ def compile_glsl(scene, *, bvh=False):
     root = compiler.lower(scene)
     stepper = _StepLowerer(compiler.names)
     step_root = stepper.lower(scene)
-    part_roots = tuple(compiler.lower(part.shape) for part in compiled.parts)
-    part_steps = tuple(stepper.lower(part.shape) for part in compiled.parts)
+    part_roots = tuple(compiler.lower(part.field) for part in compiled.parts)
+    part_steps = tuple(stepper.lower(part.field) for part in compiled.parts)
     step_source = [
         *stepper.functions,
         f"float mapStep(vec3 p, vec3 ray) {{ return {step_root}(p, ray); }}",
@@ -1011,20 +1011,20 @@ def compile_glsl(scene, *, bvh=False):
     # Evaluate the first component unconditionally so the initial best value
     # is exact even when a field exceeds any finite GLSL sentinel.
     first = compiler.lower(components[0])
-    certified = [(i, shape, box) for i, shape, box in certified if i != 0]
+    certified = [(i, field, box) for i, field, box in certified if i != 0]
     certified_ids = {i for i, _, _ in certified}
     ordinary = [
-        (i, compiler.lower(shape))
-        for i, shape in enumerate(components[1:], 1)
+        (i, compiler.lower(field))
+        for i, field in enumerate(components[1:], 1)
         if i not in certified_ids
     ]
     indexed = {}
     entries = []
-    for index, shape, box in certified:
-        name = compiler.lower(shape)
-        indexed[id(shape)] = (index, name)
+    for index, field, box in certified:
+        name = compiler.lower(field)
+        indexed[id(field)] = (index, name)
         center = tuple((a + b) / 2 for a, b in zip(box.minimum, box.maximum, strict=True))
-        entries.append((shape, box, center))
+        entries.append((field, box, center))
     tree = _build(entries, 3, 8)
     bvh_functions = []
 
@@ -1048,12 +1048,12 @@ def compile_glsl(scene, *, bvh=False):
         if child_names:
             lines.extend(f"best = {child}(p, best);" for child in child_names)
         else:
-            for shape in node.shapes:
-                index, shape_name = indexed[id(shape)]
+            for field in node.fields:
+                index, field_name = indexed[id(field)]
                 lines.extend(
                     [
                         "{",
-                        f"vec3 h = {shape_name}(p);",
+                        f"vec3 h = {field_name}(p);",
                         f"if (h.x < best.x || (h.x == best.x && {_f(index)} > best.w)) best = vec4(h, {_f(index)});",
                         "}",
                     ]
@@ -1068,10 +1068,10 @@ def compile_glsl(scene, *, bvh=False):
 
     bvh_root = emit(tree) if entries else None
     map_lines = [f"vec3 h = {first}(p);", "vec4 best = vec4(h, 0.0);"]
-    for index, shape_name in ordinary:
+    for index, field_name in ordinary:
         map_lines.extend(
             [
-                f"h = {shape_name}(p);",
+                f"h = {field_name}(p);",
                 f"if (h.x < best.x || (h.x == best.x && {_f(index)} > best.w)) best = vec4(h, {_f(index)});",
             ]
         )

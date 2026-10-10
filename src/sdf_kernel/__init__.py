@@ -5,8 +5,8 @@ from .bounds import AABB
 from .bvh import BVHNode
 from .curves import Curve
 from .dsl import (
+    Field,
     LoftStation,
-    Shape,
     Sketch,
     box,
     capsule,
@@ -48,7 +48,7 @@ __all__ = [
     "SurfaceHit",
     "Plane",
     "Placement",
-    "Shape",
+    "Field",
     "Sketch",
     "Transform",
     "Warp",
