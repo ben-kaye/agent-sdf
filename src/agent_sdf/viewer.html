@@ -228,11 +228,13 @@
             floor(mod(packed, 65536.0) / 256.0), mod(packed, 256.0)) / 255.0, 1.0);
           return;
         }
-        vec2 e = vec2(0.002, 0);
-        vec3 gradient = vec3(
-          mapHitSurface(p+e.xyy, hitPart).x-mapHitSurface(p-e.xyy, hitPart).x,
-          mapHitSurface(p+e.yxy, hitPart).x-mapHitSurface(p-e.yxy, hitPart).x,
-          mapHitSurface(p+e.yyx, hitPart).x-mapHitSurface(p-e.yyx, hitPart).x);
+        // A uniform loop start keeps each scene call inlined once, not unrolled.
+        int zero = min(uCaptureMode, 0);
+        vec3 gradient = vec3(0);
+        for (int k = zero; k < 4; k++) {
+          vec3 e = 2.0 * vec3((k + 3) >> 1 & 1, k >> 1 & 1, k & 1) - 1.0;
+          gradient += e * mapHitSurface(p + 0.002 * e, hitPart).x;
+        }
         vec3 normal = gradient / max(length(gradient), 1e-12);
         vec3 light = normalize(vec3(0.55,-0.45,0.7));
         float diffuse = max(0.0, dot(normal, light));
@@ -241,12 +243,11 @@
         float visibility = 1.0;
         if (uFinal) {
           float occlusion = 0.0;
-          float probe = mapScene(p + normal * 0.06).x;
-          occlusion += 0.5 * max(0.06 - probe, 0.0) / 0.06;
-          probe = mapScene(p + normal * 0.16).x;
-          occlusion += 0.3 * max(0.16 - probe, 0.0) / 0.16;
-          probe = mapScene(p + normal * 0.35).x;
-          occlusion += 0.2 * max(0.35 - probe, 0.0) / 0.35;
+          const vec3 probeDistance = vec3(0.06, 0.16, 0.35), probeWeight = vec3(0.5, 0.3, 0.2);
+          for (int k = zero; k < 3; k++) {
+            float probe = mapScene(p + normal * probeDistance[k]).x;
+            occlusion += probeWeight[k] * max(probeDistance[k] - probe, 0.0) / probeDistance[k];
+          }
           ambient = clamp(1.0 - 0.7 * occlusion, 0.45, 1.0);
           float shadowTravel = 0.02;
           for (int j = 0; j < 24; j++) {

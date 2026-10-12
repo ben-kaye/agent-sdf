@@ -7,7 +7,9 @@ from math import cos, hypot, isfinite, pi, sin
 
 import numpy as np
 
+from .bounds import PRIMITIVES, _revolve_sides, certificate, lipschitz, step_box, step_certificate
 from .model import compile_scene
+from .profiles import section_step_boxes
 
 _MAX_NODES = 4096
 _MAX_SWEEP_SPANS = 128
@@ -15,10 +17,11 @@ _MAX_PROFILE_SEGMENTS = 2048
 
 
 def _f(value):
-    value = float(value)
+    value = np.float32(value)
     if not isfinite(value):
         raise ValueError("GLSL geometry requires finite constants")
-    result = repr(value)
+    # The shortest float32 round trip is the exact literal the GPU stores.
+    result = str(value)
     return result if "." in result or "e" in result else result + ".0"
 
 
@@ -122,347 +125,10 @@ def _inverse_rotation(p, c, s, axis):
     return f"vec3({c} * {p}.x + {s} * {p}.y, -{s} * {p}.x + {c} * {p}.y, {p}.z)"
 
 
-def _box_map(box, matrix, translation):
-    from itertools import product
-
-    corners = product(*zip(box.minimum, box.maximum, strict=True))
-    points = [
-        tuple(
-            sum(a * p for a, p in zip(row, corner, strict=True)) + t
-            for row, t in zip(matrix, translation, strict=True)
-        )
-        for corner in corners
-    ]
-    from .bounds import AABB
-
-    return AABB(
-        tuple(min(p[i] for p in points) for i in range(len(translation))),
-        tuple(max(p[i] for p in points) for i in range(len(translation))),
-    )
-
-
-def _field_magnitude(node, box, bound):
-    center = tuple((a + b) / 2 for a, b in zip(box.minimum, box.maximum, strict=True))
-    radius = hypot(*(b - a for a, b in zip(center, box.maximum, strict=True)))
-    value = float(node.sample(np.asarray(center, dtype=float))[0])
-    if not isfinite(value):
-        raise ValueError("GLSL profile has a nonfinite field value")
-    return abs(value) + bound * radius + 1e-5
-
-
-def _lipschitz(node, box):
-    """Certify a bound over a convex box containing every march point and surface."""
-    from .bounds import AABB
-
-    kind = node.kind
-    data = node.data
-    if kind == "linear_pattern":
-        displacement = tuple((data.count - 1) * value for value in data.step)
-        child_box = AABB(
-            tuple(a - max(0.0, d) for a, d in zip(box.minimum, displacement, strict=True)),
-            tuple(b - min(0.0, d) for b, d in zip(box.maximum, displacement, strict=True)),
-        )
-    elif kind == "radial_pattern":
-        a, b = {"x": (1, 2), "y": (2, 0), "z": (0, 1)}[data.axis]
-        radius = hypot(
-            max(abs(box.minimum[a]), abs(box.maximum[a])),
-            max(abs(box.minimum[b]), abs(box.maximum[b])),
-        )
-        low, high = list(box.minimum), list(box.maximum)
-        low[a] = low[b] = -radius
-        high[a] = high[b] = radius
-        child_box = AABB(low, high)
-    elif kind == "transform":
-        transform = data.transform
-        inverse = np.asarray(transform.inverse_matrix)
-        offset = -inverse @ np.asarray(transform.offset)
-        child_box = _box_map(box, inverse, offset)
-    elif kind == "slice":
-        plane = data.plane
-        matrix = tuple(zip(plane.x_direction, plane.y_direction, strict=True))
-        child_box = _box_map(box, matrix, plane.origin)
-    elif kind == "warp":
-        center = np.asarray(box.minimum) / 2 + np.asarray(box.maximum) / 2
-        radius = np.linalg.norm(np.asarray(box.maximum) - center) * data.warp.lipschitz
-        mapped = data.warp.map_points(center)
-        child_box = AABB(tuple(mapped - radius), tuple(mapped + radius))
-    elif kind in ("extrude", "variable_extrude", "profile_sweep"):
-        if kind == "profile_sweep":
-            # A sweep samples profiles at offsets from span origins; parallel
-            # sweeps shear those offsets by up to the inverse span scale.
-            from .sweep import _spans
-
-            spans = _spans(data)
-            distance = max(
-                hypot(*(b - a for a, b in zip(span.start, q, strict=True)))
-                for span in spans
-                for q in (box.minimum, box.maximum)
-            ) / min(span.scale for span in spans)
-            child_box = AABB((-distance, -distance), (distance, distance))
-        else:
-            child_box = AABB(box.minimum[:2], box.maximum[:2])
-    elif kind == "revolve":
-        radius = max(
-            hypot(x, y)
-            for x in (box.minimum[0], box.maximum[0])
-            for y in (box.minimum[1], box.maximum[1])
-        )
-        near, far = _revolve_sides(node.children[0])
-        child_box = AABB(
-            (-radius if far else 0.0, box.minimum[2]), (radius if near else 0.0, box.maximum[2])
-        )
-    elif kind in ("field_morph", "loft"):
-        axis, transverse = data.axes
-        child_box = AABB(
-            tuple(box.minimum[i] for i in transverse),
-            tuple(box.maximum[i] for i in transverse),
-        )
-    else:
-        child_box = box
-    if kind == "loft":
-        stations = data.stations
-        axial = data.axes[0]
-
-        def section_at(a, b, position):
-            t = (position - a[0]) / (b[0] - a[0])
-            return (position, *(x + t * (y - x) for x, y in zip(a[1:], b[1:], strict=True)))
-
-        active = []
-        for a, b in zip(stations, stations[1:], strict=False):
-            start = max(a[0], box.minimum[axial])
-            end = min(b[0], box.maximum[axial])
-            if end <= start:
-                continue
-            active.append((section_at(a, b, start), section_at(a, b, end)))
-        if not active:
-            active = [(stations[0], stations[1])]
-        active_rows = tuple(row for pair in active for row in pair)
-        minimum_scale = [min(row[3 + i] for row in active_rows) for i in range(2)]
-        maximum_scale = min(max(row[3] for row in active_rows), max(row[4] for row in active_rows))
-        offset_low = [min(row[1 + i] for row in active_rows) for i in range(2)]
-        offset_high = [max(row[1 + i] for row in active_rows) for i in range(2)]
-        displacement = [
-            max(
-                abs(child_box.minimum[i] - offset_high[i]),
-                abs(child_box.maximum[i] - offset_low[i]),
-            )
-            for i in range(2)
-        ]
-        qmax = [displacement[i] / minimum_scale[i] for i in range(2)]
-        profile_box = AABB(tuple(-x for x in qmax), tuple(qmax))
-        profile = node.children[0]
-        profile_bound = _lipschitz(profile, profile_box)
-        magnitude = _field_magnitude(profile, profile_box, profile_bound)
-        transverse_bound = maximum_scale * profile_bound / min(minimum_scale)
-        axial_bound = 0.0
-        for a, b in active:
-            dz = b[0] - a[0]
-            offset_slope = [abs(b[1 + i] - a[1 + i]) / dz for i in range(2)]
-            scale_slope = [abs(b[3 + i] - a[3 + i]) / dz for i in range(2)]
-            mapped_slope = hypot(
-                *(
-                    offset_slope[i] / minimum_scale[i]
-                    + displacement[i] * scale_slope[i] / minimum_scale[i] ** 2
-                    for i in range(2)
-                )
-            )
-            axial_bound = max(
-                axial_bound,
-                max(scale_slope) * magnitude + maximum_scale * profile_bound * mapped_slope,
-            )
-        result = hypot(transverse_bound, axial_bound, 1.0)
-        children = ()
-    elif kind == "field_morph":
-        profiles = node.children
-        bounds = [_lipschitz(profile, child_box) for profile in profiles]
-        magnitudes = [
-            _field_magnitude(profile, child_box, bound)
-            for profile, bound in zip(profiles, bounds, strict=True)
-        ]
-        axial = max(
-            (a + b) / (z1 - z0)
-            for a, b, z0, z1 in zip(
-                magnitudes[:-1], magnitudes[1:], data.stations[:-1], data.stations[1:], strict=True
-            )
-        )
-        result = hypot(max(bounds), axial, 1.0)
-        children = ()
-    else:
-        children = tuple(_lipschitz(child, child_box) for child in node.children)
-    if kind in (
-        "circle",
-        "sphere",
-        "rectangle",
-        "box",
-        "cylinder",
-        "torus",
-        "capsule",
-        "tube",
-        "curve_profile",
-        "polygon",
-    ):
-        result = 1.0
-    elif kind == "custom":
-        result = node.data.lipschitz
-        if result is None:
-            raise ValueError("GLSL custom fields need a declared Lipschitz bound")
-        result = max(1.0, result)
-    elif kind in ("min", "max", "subtract", "smooth_union"):
-        # The smooth minimum's gradient is a convex combination of its inputs.
-        result = max(children)
-    elif kind in (
-        "linear_pattern",
-        "radial_pattern",
-        "offset",
-        "shell",
-        "material",
-        "feature",
-        "slice",
-    ):
-        result = children[0]
-    elif kind == "warp":
-        result = max(1.0, children[0])
-    elif kind == "transform":
-        transform = node.data.transform
-        inverse = np.asarray(transform.inverse_matrix)
-        result = children[0] * transform.distance_scale * float(np.linalg.norm(inverse, 2))
-    elif kind == "extrude":
-        result = max(children[0], 1.0)
-    elif kind == "profile_sweep":
-        result = hypot(children[0], 1.0)
-    elif kind == "revolve":
-        result = children[0] if data.angle >= 2 * pi else max(children[0], 1.0)
-    elif kind == "variable_extrude":
-        height = data.height_lipschitz if callable(data.height) else 0.0
-        offset = data.offset_lipschitz if callable(data.offset) else 0.0
-        if height is None or offset is None:
-            raise ValueError(
-                "GLSL variable extrusion needs height_lipschitz and offset_lipschitz "
-                "for callable fields"
-            )
-        result = hypot(children[0], hypot(1.0, offset + height * 0.5))
-    elif kind in ("field_morph", "loft"):
-        pass
-    else:
-        raise ValueError(f"GLSL lowering does not support field kind '{kind}'")
-    if not isfinite(result) or result <= 0:
-        raise ValueError("GLSL field Lipschitz bound must be finite and positive")
-    return result
-
-
-def _revolve_sides(profile):
-    """Whether a revolve profile reaches the +u and -u sides of its axis."""
-    from .bounds import _analytic
-
-    box = _analytic(profile)
-    if box.is_empty:
-        return True, False
-    return box.maximum[0] > 0 or box.minimum[0] >= 0, box.minimum[0] < 0
-
-
 def _field_kinds(node):
     yield node.kind
     for child in node.children:
         yield from _field_kinds(child)
-
-
-def _loft_scale_spans(first, last, ratio=2.0, limit=24):
-    """Split a loft segment so each step box stays within a scale ratio.
-
-    The march certificate divides by the smallest scale in the box. One box
-    over a taper to a point stalls before the tip is reached.
-    """
-
-    def at(t):
-        return tuple(a + t * (b - a) for a, b in zip(first, last, strict=True))
-
-    def step(t):
-        dt = 1.0 - t
-        for start, end in zip(first[3:], last[3:], strict=True):
-            origin = start + t * (end - start)
-            slope = end - start
-            if origin <= 0.0 or slope == 0.0:
-                continue
-            limit_scale = origin * ratio if slope > 0.0 else origin / ratio
-            dt = min(dt, (limit_scale - origin) / slope)
-        return dt
-
-    spans = []
-    t = 0.0
-    for _ in range(limit):
-        if t >= 1.0 - 1e-12:
-            break
-        dt = step(t)
-        nxt = 1.0 if dt <= 1e-8 else min(1.0, t + dt)
-        spans.append((at(t), at(nxt)))
-        t = nxt
-    if not spans:
-        spans.append((first, last))
-    elif t < 1.0 - 1e-12:
-        spans.append((at(t), at(1.0)))
-    return spans
-
-
-def _section_span_box(node, first, last):
-    from .bounds import AABB
-
-    profile = node.children[0].bounds()
-    if profile.is_empty or not all(isfinite(x) for x in profile.minimum + profile.maximum):
-        raise ValueError("GLSL loft needs finite profile bounds for safe stepping")
-    axis, transverse = node.data.axes
-    low, high = [0.0] * 3, [0.0] * 3
-    low[axis], high[axis] = first[0], last[0]
-    for i, world_axis in enumerate(transverse):
-        values = [
-            station[1 + i] + station[3 + i] * edge
-            for station in (first, last)
-            for edge in (profile.minimum[i], profile.maximum[i])
-        ]
-        low[world_axis], high[world_axis] = min(values), max(values)
-    return AABB(tuple(low), tuple(high))
-
-
-def _section_step_boxes(node):
-    """Return padded (box, pad) pairs for each scale-limited loft span."""
-    result = []
-    for first, last in zip(node.data.stations, node.data.stations[1:], strict=False):
-        for span in _loft_scale_spans(first, last):
-            box = _section_span_box(node, *span)
-            pad = max(
-                1e-4,
-                1e-6 * hypot(*(b - a for a, b in zip(box.minimum, box.maximum, strict=True))),
-            )
-            result.append((box.expanded(pad), pad))
-    return result
-
-
-def _step_box(node):
-    """Return the padded (box, pad) used for box-entry stepping, or None."""
-    box = node.bounds()
-    if box.is_empty or not all(isfinite(x) for x in box.minimum + box.maximum):
-        return None
-    pad = (
-        0.0
-        if node.kind == "variable_extrude"
-        else max(
-            1e-4, 1e-6 * hypot(*(b - a for a, b in zip(box.minimum, box.maximum, strict=True)))
-        )
-    )
-    return box.expanded(pad), pad
-
-
-_PRIMITIVES = {
-    "circle",
-    "sphere",
-    "rectangle",
-    "box",
-    "cylinder",
-    "torus",
-    "capsule",
-    "tube",
-    "curve_profile",
-    "polygon",
-}
 
 
 class _QueryLowerer:
@@ -483,46 +149,9 @@ class _QueryLowerer:
         return self.certificates[key]
 
     def _step_certificate(self, node):
-        from .bounds import _affine
-        from .bvh import _enclose, certificate
-
         if id(node) in self.raw_steps:
             return certificate(node)
-        kind = node.kind
-        if kind in {"min", "max", "subtract", "linear_pattern", "radial_pattern"} or kind in {
-            "material",
-            "feature",
-        }:
-            step = certificate(node, self._certificate)
-        elif kind == "transform":
-            child = self._certificate(node.children[0])
-            if child is None:
-                return None
-            # Box entry and distance steps map back through the ray speed;
-            # the condition number bounds both directions of the stretch.
-            transform = node.data.transform
-            condition = float(np.linalg.norm(np.asarray(transform.matrix, dtype=float), 2)) * float(
-                np.linalg.norm(np.asarray(transform.inverse_matrix, dtype=float), 2)
-            )
-            box = _affine(child[0], transform.matrix, transform.offset)
-            box = box.expanded(1e-5 * (1 + max(map(abs, box.minimum + box.maximum))) * condition)
-            step = (box, child[1] / condition)
-        elif kind == "loft":
-            step = (_enclose([box for box, _ in _section_step_boxes(node)]), 1.0)
-        elif kind in _PRIMITIVES:
-            step = certificate(node)
-        else:
-            try:
-                padded = _step_box(node)
-            except ValueError:
-                padded = None
-            step = None if padded is None else (padded[0], 1.0)
-        if step is None:
-            return None
-        value = certificate(node)
-        if value is None:
-            return None
-        return step[0].union(value[0]), min(step[1], value[1])
+        return step_certificate(node, self._certificate)
 
     def _add(self, prefix, dim, body, result="vec2"):
         return self.functions.add(prefix, result, f"vec{dim} p, vec{dim} ray", body)
@@ -673,8 +302,8 @@ class _QueryLowerer:
 
     def _section_step(self, node):
         lines = ["float best = 1e30;"]
-        for box, pad in _section_step_boxes(node):
-            bound = max(1.0, _lipschitz(node, box))
+        for box, pad in section_step_boxes(node):
+            bound = max(1.0, lipschitz(node, box))
             lines.extend(
                 [
                     "{",
@@ -694,13 +323,13 @@ class _QueryLowerer:
     def _raw_step(self, node, raw):
         from .bounds import AABB
 
-        if node.kind in _PRIMITIVES:
+        if node.kind in PRIMITIVES:
             return "return distance;"
 
         box = node.bounds()
         if box.is_empty:
             return "return 1e30;"
-        padded = _step_box(node)
+        padded = step_box(node)
         finite = padded is not None
         if finite:
             box, pad = padded
@@ -708,7 +337,7 @@ class _QueryLowerer:
             raise ValueError(f"GLSL {node.kind} needs finite bounds for conservative stepping")
         else:
             box = AABB((0.0,) * node.dim, (0.0,) * node.dim)
-        bound = _lipschitz(node, box)
+        bound = lipschitz(node, box)
         if finite:
             lo, hi = _v(box.minimum), _v(box.maximum)
             if node.kind == "variable_extrude":
@@ -731,6 +360,9 @@ class _QueryLowerer:
 
 
 _HELPERS = """
+vec4 pick(vec4 best, vec3 h, float index) {
+  return h.x < best.x || (h.x == best.x && index > best.w) ? vec4(h, index) : best;
+}
 float rayBoxEntry(vec2 p, vec2 ray, vec2 lo, vec2 hi) {
   float near = 0.0, far = 1e30;
   for (int axis = 0; axis < 2; ++axis) {
@@ -914,18 +546,7 @@ class _Lowerer:
         return self.names[key]
 
     def _raw_step(self, node):
-        if node.kind in {
-            "circle",
-            "sphere",
-            "rectangle",
-            "box",
-            "cylinder",
-            "torus",
-            "capsule",
-            "tube",
-            "curve_profile",
-            "polygon",
-        }:
+        if node.kind in PRIMITIVES:
             return True
         if node.kind in {
             "min",
@@ -946,7 +567,6 @@ class _Lowerer:
 
     def _accelerated_body(self, node, children):
         from .bounds import AABB, _affine, _points_bounds
-        from .bvh import certificate as _certificate
 
         if node.kind == "min":
             components, pending = [], [node]
@@ -956,12 +576,12 @@ class _Lowerer:
                     pending.extend(reversed(current.children))
                 else:
                     components.append(current)
-            entries = [(f"{self.names[id(field)]}(p)", _certificate(field)) for field in components]
+            entries = [(f"{self.names[id(field)]}(p)", certificate(field)) for field in components]
         elif node.kind in {"linear_pattern", "radial_pattern"}:
-            certificate = _certificate(node.children[0])
-            if certificate is None or not 4 <= node.data.count <= 256:
+            child = certificate(node.children[0])
+            if child is None or not 4 <= node.data.count <= 256:
                 return None
-            box, scale = certificate
+            box, scale = child
             entries = []
             for index in range(node.data.count):
                 if node.kind == "linear_pattern":
@@ -1389,94 +1009,9 @@ def compile_glsl(scene, *, bvh=True):
         _surface_tracer(compiled, part_roots, part_queries, enabled=traverse_parts)
     )
 
-    def assemble(map_scene, *emitters):
-        functions = {}
-        for emitter in (compiler.functions, query.functions, *emitters):
-            functions.update(emitter.source)
-        roots = "\n".join([map_scene, *query_source, *surface_source])
-        return "\n".join([_HELPERS, *_reachable(functions, roots), roots])
-
-    if not bvh:
-        return assemble(f"vec3 mapScene(vec3 p) {{ return {root}(p); }}")
-
-    from .bvh import _build, _union_components, certificate
-
-    # Gap pruning only skips a component whose certificate bounds its value
-    # above the current best, so the union stays exact for any field mix.
-    components = _union_components(scene)
-    certified = [
-        (index, component, certificate(component)) for index, component in enumerate(components)
-    ]
-    certified = [(index, component, cert) for index, component, cert in certified if cert]
-    if len(certified) < 4:
-        return assemble(f"vec3 mapScene(vec3 p) {{ return {root}(p); }}")
-
-    # Evaluate the first component unconditionally so the initial best value
-    # is exact even when a field exceeds any finite GLSL sentinel.
-    first = compiler.lower(components[0])
-    certified = [(i, field, box) for i, field, box in certified if i != 0]
-    certified_ids = {i for i, _, _ in certified}
-    ordinary = [
-        (i, compiler.lower(field))
-        for i, field in enumerate(components[1:], 1)
-        if i not in certified_ids
-    ]
-    indexed = {}
-    entries = []
-    for index, field, (box, scale) in certified:
-        name = compiler.lower(field)
-        indexed[id(field)] = (index, name, scale)
-        center = tuple((a + b) / 2 for a, b in zip(box.minimum, box.maximum, strict=True))
-        entries.append((field, box, center))
-    tree = _build(entries, 3, 8)
-    bvh_functions = _Functions()
-
-    def emit(node):
-        emitted = [emit(child) for child in node.children]
-        child_names = [child for child, _ in emitted]
-        scale = min([s for _, s in emitted] + [indexed[id(field)][2] for field in node.fields])
-        low = _v(
-            float(np.nextafter(np.float32(v), np.float32(-np.inf))) for v in node.bounds.minimum
-        )
-        high = _v(
-            float(np.nextafter(np.float32(v), np.float32(np.inf))) for v in node.bounds.maximum
-        )
-        lines = [
-            f"vec3 lo = {low};",
-            f"vec3 hi = {high};",
-            "if (any(lessThan(p, lo)) || any(greaterThan(p, hi))) {",
-            "  vec3 gap = max(max(lo - p, p - hi), 0.0);",
-            f"  if (length(gap) * {_f(np.nextafter(np.float32(scale), np.float32(0)))} > best.x + 1e-5 * (1.0 + abs(best.x))) return best;",
-            "}",
-        ]
-        if child_names:
-            lines.extend(f"best = {child}(p, best);" for child in child_names)
-        else:
-            for field in node.fields:
-                index, field_name, _ = indexed[id(field)]
-                lines.extend(
-                    [
-                        "{",
-                        f"vec3 h = {field_name}(p);",
-                        f"if (h.x < best.x || (h.x == best.x && {_f(index)} > best.w)) best = vec4(h, {_f(index)});",
-                        "}",
-                    ]
-                )
-        lines.append("return best;")
-        body = "\n".join(f"  {line}" for line in lines)
-        return bvh_functions.add("bvh", "vec4", "vec3 p, vec4 best", body), scale
-
-    bvh_root = emit(tree)[0] if entries else None
-    map_lines = [f"vec3 h = {first}(p);", "vec4 best = vec4(h, 0.0);"]
-    for index, field_name in ordinary:
-        map_lines.extend(
-            [
-                f"h = {field_name}(p);",
-                f"if (h.x < best.x || (h.x == best.x && {_f(index)} > best.w)) best = vec4(h, {_f(index)});",
-            ]
-        )
-    if bvh_root is not None:
-        map_lines.append(f"best = {bvh_root}(p, best);")
-    map_lines.append("return best.xyz;")
-    map_scene = "vec3 mapScene(vec3 p) {\n" + "\n".join(f"  {line}" for line in map_lines) + "\n}"
-    return assemble(map_scene, bvh_functions)
+    functions = {**compiler.functions.source, **query.functions.source}
+    # The scene union is already pruned by the part hierarchies it calls.
+    roots = "\n".join(
+        [f"vec3 mapScene(vec3 p) {{ return {root}(p); }}", *query_source, *surface_source]
+    )
+    return "\n".join([_HELPERS, *_reachable(functions, roots), roots])

@@ -19,7 +19,7 @@ class _ValueHierarchy:
     def __init__(self, functions):
         self.functions = functions
 
-    def lower(self, entries, dim, *, later_wins=True):
+    def lower(self, entries, dim):
         """Return exact union evaluation, including original-order label ties.
 
         Entries contain (expression, certificate). Uncertified operands are
@@ -45,13 +45,6 @@ class _ValueHierarchy:
             dim,
             4,
         )
-        order_test = ">" if later_wins else "<"
-
-        def evaluate(index, expression):
-            return [
-                f"vec3 h = {expression};",
-                f"if (h.x < best.x || (h.x == best.x && {_f(index)} {order_test} best.w)) best = vec4(h, {_f(index)});",
-            ]
 
         def emit(node):
             children = [emit(child) for child in node.children]
@@ -77,8 +70,9 @@ class _ValueHierarchy:
                 # orderings duplicate every subtree per level.
                 lines.extend(f"best = {child}(p, best);" for child in children)
             else:
-                for index in node.fields:
-                    lines.extend(["{", *evaluate(index, indexed[index][0]), "}"])
+                lines.extend(
+                    f"best = pick(best, {indexed[index][0]}, {_f(index)});" for index in node.fields
+                )
             lines.append("return best;")
             return self.functions.add(
                 "fieldHierarchy", "vec4", f"vec{dim} p, vec4 best", "\n".join(lines)
@@ -88,6 +82,6 @@ class _ValueHierarchy:
         lines = [f"vec4 best = vec4({entries[0][0]}, 0.0);"]
         for index, (expr, cert) in enumerate(entries[1:], 1):
             if cert is None:
-                lines.extend(["{", *evaluate(index, expr), "}"])
+                lines.append(f"best = pick(best, {expr}, {_f(index)});")
         lines.extend([f"best = {root}(p, best);", "return best.xyz;"])
         return lines

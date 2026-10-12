@@ -161,44 +161,55 @@ bool traceSurface(vec3 origin, vec3 ray, float start, float end, bool escaping,
   float candidateTravel;
   vec3 candidateHit;
 """)
-    for index in ordinary:
-        source.append(f"""
-  if (marchPart({index}, origin, ray, start, travel, escaping, candidateTravel, candidateHit)) {{
-    if (part < 0 || candidateTravel < travel || (candidateTravel == travel && {index} > part)) {{
-      travel = candidateTravel; hit = candidateHit; part = {index};
-    }}
-  }}
-""")
-    if entries:
-        source.append(f"""
-  int stack[{depth}];
-  int count = 1;
-  stack[0] = 0;
-  for (int visited = 0; visited < {len(nodes)}; ++visited) {{
-    if (count == 0) break;
-    int node = stack[--count];
-    vec2 interval = partRayInterval(origin, ray, partBoundsLo[node], partBoundsHi[node], start, travel);
-    if (interval.x > interval.y) continue;
-    ivec3 links = partLinks[node];
-    if (links.z >= 0) {{
+    # Pick each march interval first so the loop inlines marchPart once.
+    ordinary_march = f"""
+    if (visited < {len(ordinary)}) {{
+      candidate = ordinaryParts[visited];
+      interval = vec2(start, travel);
+      skipSurface = escaping;
+    }}"""
+    bvh_march = """
+    {
+      if (count == 0) break;
+      int node = stack[--count];
+      interval = partRayInterval(origin, ray, partBoundsLo[node], partBoundsHi[node], start, travel);
+      if (interval.x > interval.y) continue;
+      ivec3 links = partLinks[node];
+      if (links.z < 0) {
+        vec2 left = partRayInterval(origin, ray, partBoundsLo[links.x], partBoundsHi[links.x], start, travel);
+        vec2 right = partRayInterval(origin, ray, partBoundsLo[links.y], partBoundsHi[links.y], start, travel);
+        bool useLeft = left.x <= left.y;
+        bool useRight = right.x <= right.y;
+        if (useLeft && useRight) {
+          bool leftFirst = left.x <= right.x;
+          stack[count++] = leftFirst ? links.y : links.x;
+          stack[count++] = leftFirst ? links.x : links.y;
+        } else if (useLeft) stack[count++] = links.x;
+        else if (useRight) stack[count++] = links.y;
+        continue;
+      }
+      candidate = links.z;
       // A jump to a later box has already left the previous transparent surface.
-      bool skipSurface = escaping && interval.x == start;
-      if (marchPart(links.z, origin, ray, interval.x, interval.y, skipSurface, candidateTravel, candidateHit)) {{
-        if (part < 0 || candidateTravel < travel || (candidateTravel == travel && links.z > part)) {{
-          travel = candidateTravel; hit = candidateHit; part = links.z;
-        }}
+      skipSurface = escaping && interval.x == start;
+    }"""
+    if ordinary:
+        source.append(
+            f"  const int ordinaryParts[{len(ordinary)}] = int[]({', '.join(map(str, ordinary))});"
+        )
+    if entries:
+        source.append(f"  int stack[{depth}];\n  int count = 1;\n  stack[0] = 0;")
+    if ordinary or entries:
+        branches = ((ordinary_march, ordinary), (bvh_march, entries))
+        select = " else".join(branch for branch, used in branches if used)
+        source.append(f"""
+  for (int visited = 0; visited < {len(ordinary) + len(nodes)}; ++visited) {{
+    int candidate;
+    vec2 interval;
+    bool skipSurface;{select}
+    if (marchPart(candidate, origin, ray, interval.x, interval.y, skipSurface, candidateTravel, candidateHit)) {{
+      if (part < 0 || candidateTravel < travel || (candidateTravel == travel && candidate > part)) {{
+        travel = candidateTravel; hit = candidateHit; part = candidate;
       }}
-    }} else {{
-      vec2 left = partRayInterval(origin, ray, partBoundsLo[links.x], partBoundsHi[links.x], start, travel);
-      vec2 right = partRayInterval(origin, ray, partBoundsLo[links.y], partBoundsHi[links.y], start, travel);
-      bool useLeft = left.x <= left.y;
-      bool useRight = right.x <= right.y;
-      if (useLeft && useRight) {{
-        bool leftFirst = left.x <= right.x;
-        stack[count++] = leftFirst ? links.y : links.x;
-        stack[count++] = leftFirst ? links.x : links.y;
-      }} else if (useLeft) stack[count++] = links.x;
-      else if (useRight) stack[count++] = links.y;
     }}
   }}
 """)

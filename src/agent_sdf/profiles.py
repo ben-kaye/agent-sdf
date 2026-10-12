@@ -1,5 +1,7 @@
 """Profile lofts, field morphs, and spatially varying extrusion fields."""
 
+from math import hypot, isfinite
+
 import numpy as np
 
 from .field import Field, LoftStation, _number, _positive
@@ -241,3 +243,150 @@ def operation_bounds(node, level, analytic):
     from .bounds import clip_bounds
 
     return clip_bounds(AABB(tuple(lower), tuple(upper)), node.data.bounds, padding)
+
+
+def _loft_scale_spans(first, last, ratio=2.0, limit=24):
+    """Split a loft segment so each step box stays within a scale ratio.
+
+    The march certificate divides by the smallest scale in the box. One box
+    over a taper to a point stalls before the tip is reached.
+    """
+
+    def at(t):
+        return tuple(a + t * (b - a) for a, b in zip(first, last, strict=True))
+
+    def step(t):
+        dt = 1.0 - t
+        for start, end in zip(first[3:], last[3:], strict=True):
+            origin = start + t * (end - start)
+            slope = end - start
+            if origin <= 0.0 or slope == 0.0:
+                continue
+            limit_scale = origin * ratio if slope > 0.0 else origin / ratio
+            dt = min(dt, (limit_scale - origin) / slope)
+        return dt
+
+    spans = []
+    t = 0.0
+    for _ in range(limit):
+        if t >= 1.0 - 1e-12:
+            break
+        dt = step(t)
+        nxt = 1.0 if dt <= 1e-8 else min(1.0, t + dt)
+        spans.append((at(t), at(nxt)))
+        t = nxt
+    if not spans:
+        spans.append((first, last))
+    elif t < 1.0 - 1e-12:
+        spans.append((at(t), at(1.0)))
+    return spans
+
+
+def _section_span_box(node, first, last):
+    from .bounds import AABB
+
+    profile = node.children[0].bounds()
+    if profile.is_empty or not all(isfinite(x) for x in profile.minimum + profile.maximum):
+        raise ValueError("GLSL loft needs finite profile bounds for safe stepping")
+    axis, transverse = node.data.axes
+    low, high = [0.0] * 3, [0.0] * 3
+    low[axis], high[axis] = first[0], last[0]
+    for i, world_axis in enumerate(transverse):
+        values = [
+            station[1 + i] + station[3 + i] * edge
+            for station in (first, last)
+            for edge in (profile.minimum[i], profile.maximum[i])
+        ]
+        low[world_axis], high[world_axis] = min(values), max(values)
+    return AABB(tuple(low), tuple(high))
+
+
+def section_step_boxes(node):
+    """Return padded (box, pad) pairs for each scale-limited loft span."""
+    result = []
+    for first, last in zip(node.data.stations, node.data.stations[1:], strict=False):
+        for span in _loft_scale_spans(first, last):
+            box = _section_span_box(node, *span)
+            pad = max(
+                1e-4,
+                1e-6 * hypot(*(b - a for a, b in zip(box.minimum, box.maximum, strict=True))),
+            )
+            result.append((box.expanded(pad), pad))
+    return result
+
+
+def _field_magnitude(node, box, bound):
+    center = tuple((a + b) / 2 for a, b in zip(box.minimum, box.maximum, strict=True))
+    radius = hypot(*(b - a for a, b in zip(center, box.maximum, strict=True)))
+    value = float(node.sample(np.asarray(center, dtype=float))[0])
+    if not isfinite(value):
+        raise ValueError("section profile has a nonfinite field value")
+    return abs(value) + bound * radius + 1e-5
+
+
+def _section_at(a, b, position):
+    t = (position - a[0]) / (b[0] - a[0])
+    return (position, *(x + t * (y - x) for x, y in zip(a[1:], b[1:], strict=True)))
+
+
+def section_lipschitz(node, box, recurse):
+    """Bound a loft or field morph's slope over a 3D box."""
+    from .bounds import AABB
+
+    stations, (axial, transverse) = node.data.stations, node.data.axes
+    planar = AABB(
+        tuple(box.minimum[i] for i in transverse), tuple(box.maximum[i] for i in transverse)
+    )
+    if node.kind == "field_morph":
+        bounds = [recurse(profile, planar) for profile in node.children]
+        magnitudes = [
+            _field_magnitude(profile, planar, bound)
+            for profile, bound in zip(node.children, bounds, strict=True)
+        ]
+        slope = max(
+            (a + b) / (z1 - z0)
+            for a, b, z0, z1 in zip(
+                magnitudes[:-1], magnitudes[1:], stations[:-1], stations[1:], strict=True
+            )
+        )
+        return hypot(max(bounds), slope, 1.0)
+    active = []
+    for a, b in zip(stations, stations[1:], strict=False):
+        start = max(a[0], box.minimum[axial])
+        end = min(b[0], box.maximum[axial])
+        if end > start:
+            active.append((_section_at(a, b, start), _section_at(a, b, end)))
+    if not active:
+        active = [(stations[0], stations[1])]
+    rows = tuple(row for pair in active for row in pair)
+    minimum_scale = [min(row[3 + i] for row in rows) for i in range(2)]
+    maximum_scale = min(max(row[3] for row in rows), max(row[4] for row in rows))
+    offset_low = [min(row[1 + i] for row in rows) for i in range(2)]
+    offset_high = [max(row[1 + i] for row in rows) for i in range(2)]
+    displacement = [
+        max(abs(planar.minimum[i] - offset_high[i]), abs(planar.maximum[i] - offset_low[i]))
+        for i in range(2)
+    ]
+    reach = [displacement[i] / minimum_scale[i] for i in range(2)]
+    profile_box = AABB(tuple(-x for x in reach), tuple(reach))
+    profile = node.children[0]
+    profile_bound = recurse(profile, profile_box)
+    magnitude = _field_magnitude(profile, profile_box, profile_bound)
+    transverse_bound = maximum_scale * profile_bound / min(minimum_scale)
+    axial_bound = 0.0
+    for a, b in active:
+        dz = b[0] - a[0]
+        offset_slope = [abs(b[1 + i] - a[1 + i]) / dz for i in range(2)]
+        scale_slope = [abs(b[3 + i] - a[3 + i]) / dz for i in range(2)]
+        mapped_slope = hypot(
+            *(
+                offset_slope[i] / minimum_scale[i]
+                + displacement[i] * scale_slope[i] / minimum_scale[i] ** 2
+                for i in range(2)
+            )
+        )
+        axial_bound = max(
+            axial_bound,
+            max(scale_slope) * magnitude + maximum_scale * profile_bound * mapped_slope,
+        )
+    return hypot(transverse_bound, axial_bound, 1.0)
